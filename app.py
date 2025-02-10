@@ -17,11 +17,9 @@ from apscheduler.triggers.cron import CronTrigger
 from email_service import EmailService
 
 
-# check events for when subscription is not auto pay for renewal.
-# checkout for conflicting events regarding subscription
-# billing portal embedded.
-# with api restrict price updates at the customer billing portal.
-# test crons for trial plan , test crons for benefits end date.
+
+# trial plan creation + integration , bundles / plan creation & listing.  
+
 
 app = Flask(__name__)
 app.config.from_object(Config)
@@ -189,110 +187,76 @@ def get_payment_methods_for_country(country_code):
 @app.route('/api/products', methods=['GET'])
 def get_products():
     try:
-        plan_duration = request.args.get('plan_duration', '').lower()
-        product_type = request.args.get('type', '').lower()
-        country_code = request.args.get('countryCode', 'US').upper()
-        target_currency = get_currency_for_country(country_code).lower()
-
-        if plan_duration and plan_duration not in ['monthly', 'yearly']:
-            return jsonify({"error": "Invalid plan_duration"}), 400
-            
-        if product_type and product_type not in ['subscription_plan', 'top_up', 'trial']:
-            return jsonify({"error": "Invalid type"}), 400
-
+        selected_option = request.args.get('option', '')
         products = stripe.Product.list(active=True)
         product_data = []
-        subscription_data = []  # Separate list for subscription and trial products
 
         for product in products.data:
-            product_type_from_metadata = product.metadata.get('type', '').lower()
-            
-            # Skip if product type filter is set and doesn't match
-            if product_type and product_type_from_metadata not in ['subscription_plan', 'trial'] and product_type_from_metadata != product_type:
+            # Get base price first
+            prices = stripe.Price.list(product=product.id)
+            if not prices.data:
                 continue
+                
+            base_price = prices.data[0]  # Using first price as base price
+            base_unit_amount = base_price.unit_amount / 200  # Base price is for 200 credits
 
-            prices = stripe.Price.list(
-                product=product.id,
-                active=True,
-                expand=['data.currency_options']
-            )
-            price_data = []
+            # Get all price options from metadata
+            credit_options = []
+            for key in product.metadata:
+                if key.startswith('option-') and key.replace('option-', '').isdigit():
+                    try:
+                        credits = int(product.metadata[key])
+                        credit_options.append({
+                            "key": key,
+                            "credits": credits
+                        })
+                    except (ValueError, TypeError):
+                        print(f"Warning: Invalid value for {key}: {product.metadata[key]}")
             
-            for price in prices.data:
-                currency_amount = (price.currency_options.get(target_currency, {}).get('unit_amount', price.unit_amount) if hasattr(price, 'currency_options') else price.unit_amount) / 100
-                
-                if product_type_from_metadata == 'subscription_plan':
-                    if not price.recurring:
-                        continue
-                        
-                    current_duration = 'yearly' if price.recurring.interval == 'year' else 'monthly'
-                    if plan_duration and current_duration != plan_duration:
-                        continue
-
-                    price_data.append({
-                        "price_id": price.id,
-                        "currency": target_currency,
-                        "amount": currency_amount,
-                        "interval": price.recurring.interval,
-                        "interval_count": price.recurring.interval_count
-                    })
-                
-                elif product_type_from_metadata == 'trial':
-                    if price.recurring:  # Skip recurring prices for trial products
-                        continue
-
-                    price_data.append({
-                        "price_id": price.id,
-                        "currency": target_currency,
-                        "amount": currency_amount,
-                        "duration_days": int(product.metadata.get('duration_days', 0))  # Get trial duration from metadata
-                    })
-                
-                elif product_type_from_metadata == 'top_up':
-                    if price.recurring:
-                        continue
-
-                    price_data.append({
-                        "price_id": price.id,
-                        "currency": target_currency,
-                        "amount": currency_amount,
-                        "credits": int(price.metadata.quantity)
-                    })
-
-            if price_data:
-                product_entry = {
-                    "id": product.id,
-                    "name": product.name,
-                    "description": product.description,
-                    "metadata": product.metadata,
-                    "marketing_features": [f["name"] for f in product.marketing_features] if hasattr(product, 'marketing_features') else [],
-                    "type": product_type_from_metadata,
-                    "prices": price_data
+            credit_options = sorted(credit_options, key=lambda x: x['credits'])
+            
+            # Calculate price for each credit option
+            price_data = []
+            for option in credit_options:
+                price_entry = {
+                    "option": option['key'],
+                    "credits": option['credits'],
+                    "amount": (base_unit_amount * option['credits']) / 100,  # Convert to currency units
+                    "price_id": base_price.id
                 }
-                
-                # Group subscription and trial products together
-                if product_type_from_metadata in ['subscription_plan', 'trial']:
-                    subscription_data.append(product_entry)
-                else:
-                    product_data.append(product_entry)
+                price_data.append(price_entry)
 
-        # Combine subscription data with regular product data
-        if subscription_data:
-            product_data = subscription_data + product_data
+            product_entry = {
+                "id": product.id,
+                "name": product.name,
+                "description": product.description,
+                "validity_in_days": int(product.metadata.get('validity_in_days', 90)),
+                "credit_options": credit_options,
+                "prices": price_data
+            }
+
+            if selected_option:
+                matching_prices = [p for p in price_data if p['option'] == selected_option]
+                if matching_prices:
+                    product_entry['selected_price'] = matching_prices[0]
+
+            product_data.append(product_entry)
 
         return jsonify({
             "products": product_data,
             "filters": {
-                "plan_duration": plan_duration or "all",
-                "type": product_type or "all"
+                "selected_option": selected_option or "all"
             }
         }), 200
 
     except Exception as e:
         print(f"Error in get_products: {str(e)}")
         return jsonify({"error": str(e)}), 500
-
-
+def format_currency(amount, currency):
+    """Helper function to format currency amounts"""
+    symbols = {'usd': '$', 'gbp': '£', 'eur': '€'}
+    symbol = symbols.get(currency.lower(), '')
+    return f"{symbol}{amount:.2f}"
 def get_user_by_email(email: str, db: Session):
    return db.query(User).filter(User.email == email).first()
 
