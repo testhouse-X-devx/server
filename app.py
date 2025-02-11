@@ -44,19 +44,21 @@ class User(Base):
     email = Column(String(255), unique=True)
     role = Column(String(50), default='admin')  # Keep this enum as it's working
     
+
+    # if bundle plan 
+    validity_expiration = Column(DateTime, nullable=True)
+
     # Admin-specific columns
     stripe_customer_id = Column(String(255), unique=True, nullable=True)
     stripe_subscription_id = Column(String(255), unique=True, nullable=True)
-    max_users = Column(Integer, default=0)
     has_used_trial = Column(Boolean, default=False)
     trial_end_date = Column(DateTime, nullable=True)
     
-     # New fields for subscription cancellation
     is_blocked = Column(Boolean, default=False)
     benefits_end_date = Column(DateTime, nullable=True)
     # Common columns for both admin and team members
-    current_credits = Column(Integer, default=0)
-    current_scans = Column(Integer, default=0)
+    current_user_story = Column(Integer, default=0)
+    current_test_case = Column(Integer, default=0)
     
     # Team member creation tracking
     created_by = Column(Integer, nullable=True)
@@ -68,7 +70,7 @@ class Transaction(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey('users.id'))
     primary_type = Column(String(50), nullable=False)  # 'credit' or 'scan' or 'generation'
-    source_type = Column(String(50), nullable=False)   # 'subscription', 'top_up', or 'trial' 
+    source_type = Column(String(50), nullable=False)   # 'subscription', 'bundle', or 'trial' 
     transaction_type = Column(String(50), nullable=False)  # 'received', 'used', or 'reset'
     value = Column(Integer)
     subscription_id = Column(String(255))
@@ -188,17 +190,48 @@ def get_payment_methods_for_country(country_code):
 def get_products():
     try:
         selected_option = request.args.get('option', '')
+        include_trials = request.args.get('include_trials', 'true').lower() == 'true'
         products = stripe.Product.list(active=True)
         product_data = []
 
         for product in products.data:
+            # Check if product is a trial product
+            is_trial = product.metadata.get('type', '').lower() == 'trial'
+            
+            # Skip trial products if not requested
+            if not include_trials and is_trial:
+                continue
+
             # Get base price first
             prices = stripe.Price.list(product=product.id)
             if not prices.data:
                 continue
                 
             base_price = prices.data[0]  # Using first price as base price
-            base_unit_amount = base_price.unit_amount / 200  # Base price is for 200 credits
+            
+            # Handle trial products differently
+            if is_trial:
+                trial_entry = {
+                    "id": product.id,
+                    "name": product.name,
+                    "description": product.description,
+                    "type": "trial",
+                    "validity_in_days": int(product.metadata.get('validity_in_days', 14)),
+                    "credits": {
+                        "test_case": int(product.metadata.get('test_case', 0)),
+                        "user_story": int(product.metadata.get('user_story', 0))
+                    },
+                    "price": {
+                        "amount": 0,
+                        "price_id": base_price.id
+                    }
+                }
+                product_data.append(trial_entry)
+                continue
+
+            # Get base units from transform_quantity.divide_by
+            base_units = base_price.transform_quantity.get('divide_by') if base_price.transform_quantity else 1
+            base_unit_amount = base_price.unit_amount / base_units
 
             # Get all price options from metadata
             credit_options = []
@@ -230,6 +263,7 @@ def get_products():
                 "id": product.id,
                 "name": product.name,
                 "description": product.description,
+                "type": "regular",
                 "validity_in_days": int(product.metadata.get('validity_in_days', 90)),
                 "credit_options": credit_options,
                 "prices": price_data
@@ -245,7 +279,8 @@ def get_products():
         return jsonify({
             "products": product_data,
             "filters": {
-                "selected_option": selected_option or "all"
+                "selected_option": selected_option or "all",
+                "include_trials": include_trials
             }
         }), 200
 
@@ -262,65 +297,115 @@ def get_user_by_email(email: str, db: Session):
 
 @app.route('/api/create-checkout-session', methods=['POST'])
 def create_checkout_session():
-   db = SessionLocal()
-   try:
-       data = request.get_json()
-       price_id = data.get('priceId')
-       email = data.get('email')
-       country_code = data.get('countryCode', 'US')
-    #    product_type = data.get('productType', 'subscription_plan')
+    db = SessionLocal()
+    try:
+        data = request.get_json()
+        email = data.get('email')
+        items = data.get('items', [])  # Array of {priceId, credits}
+        country_code = 'GB'
 
-       if not email:
-           return jsonify({'error': 'Email is required'}), 400
+        if not email:
+            return jsonify({'error': 'Email is required'}), 400
+            
+        if not items:
+            return jsonify({'error': 'No items selected'}), 400
 
-       # Get price and product details to check type
-       price = stripe.Price.retrieve(price_id)
-       product = stripe.Product.retrieve(price.product)
-       product_type = product.metadata.get('type')
+        # Validate plan combination
+        try:
+            has_trial = False
+            has_regular = False
+            
+            # Fetch all prices and their associated products
+            for item in items:
+                price_id = item.get('priceId')
+                if not price_id:
+                    continue
+                    
+                # Get price and its associated product
+                price = stripe.Price.retrieve(price_id, expand=['product'])
+                if not price.product:
+                    continue
+                    
+                # Check product type from metadata
+                is_trial = price.product.metadata.get('type', '').lower() == 'trial'
+                
+                if is_trial:
+                    has_trial = True
+                else:
+                    has_regular = True
+                
+                # If we find both types, return error
+                if has_trial and has_regular:
+                    return jsonify({
+                        'error': 'Cannot combine trial plans with regular plans. Please select either a trial plan or regular plans.'
+                    }), 400
 
-       user = get_user_by_email(email, db)
-       if not user:
-           user = User(email=email)
-           db.add(user)
+        except stripe.error.StripeError as e:
+            return jsonify({'error': f'Error validating plans: {str(e)}'}), 400
 
-       # Validate trial purchase
-       if product_type == 'trial' and user.has_used_trial:
-           return jsonify({'error': 'Trial plan can only be purchased once'}), 400
+        # Get or create user
+        user = get_user_by_email(email, db)
+        if not user:
+            user = User(email=email)
+            db.add(user)
 
-       # Validate top-up purchase
-       if product_type == 'top_up' and not user.stripe_subscription_id:
-           return jsonify({'error': 'Must have an active subscription to purchase top-ups'}), 400
+        # Get or create Stripe customer
+        if not user.stripe_customer_id:
+            customer = stripe.Customer.create(
+                email=email,
+                metadata={"user_id": user.id}
+            )
+            user.stripe_customer_id = customer.id
+            db.commit()
 
-       if not user.stripe_customer_id:
-           customer = stripe.Customer.create(
-               email=email,
-               metadata={"user_id": user.id}
-           )
-           user.stripe_customer_id = customer.id
-           db.commit()
+        # Create line items for checkout
+        line_items = []
+        metadata = {}
+        
+        for item in items:
+            price_id = item.get('priceId')
+            credits = item.get('credits')  # Get credits to use as quantity
+            
+            if price_id and credits:
+                if isinstance(credits, dict):  # Handle trial plan credits
+                    # For trial plans, we store the specific credit types in metadata
+                    metadata['test_case_credits'] = credits.get('test_case', 0)
+                    metadata['user_story_credits'] = credits.get('user_story', 0)
+                    # Use 1 as quantity for trial plans since they're one-time
+                    line_items.append({
+                        'price': price_id,
+                        'quantity': 1
+                    })
+                else:
+                    line_items.append({
+                        'price': price_id,
+                        'quantity': credits
+                    })
 
-       checkout_session = stripe.checkout.Session.create(
-           customer=user.stripe_customer_id,
-           payment_method_types=['card'],
-           line_items=[{'price': price_id, 'quantity': 1}],
-           mode='subscription' if product_type == 'subscription_plan' else 'payment',
-           currency=get_currency_for_country(country_code).lower(),
-           success_url=f"{request.headers.get('Origin', 'http://localhost:5173')}/success?session_id={{CHECKOUT_SESSION_ID}}",
-           cancel_url=f"{request.headers.get('Origin', 'http://localhost:5173')}/cancel",
-           allow_promotion_codes=True,
-           expand=['line_items']
-       )
+        # Create checkout session
+        checkout_session = stripe.checkout.Session.create(
+            customer=user.stripe_customer_id,
+            payment_method_types=['card'],
+            line_items=line_items,
+            mode='payment',
+            currency=get_currency_for_country(country_code).lower(),
+            success_url=f"{request.headers.get('Origin', 'http://localhost:5173')}/success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{request.headers.get('Origin', 'http://localhost:5173')}/cancel",
+            allow_promotion_codes=True,
+            expand=['line_items'],
+            metadata=metadata  # Add metadata for trial plan credits
+        )
 
-       return jsonify({
-           'sessionId': checkout_session.id,
-           'url': checkout_session.url
-       }), 200
+        return jsonify({
+            'sessionId': checkout_session.id,
+            'url': checkout_session.url
+        }), 200
 
-   except Exception as e:
-       db.rollback()
-       return jsonify({'error': str(e)}), 500
-   finally:
-       db.close()
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -335,7 +420,6 @@ def webhook():
         )
         print(f"Received webhook event: {event['type']}")
         
-        # for catching the buying of top-up and trial
         if event['type'] == 'checkout.session.completed':
             session = event['data']['object']
             
@@ -345,337 +429,167 @@ def webhook():
                     expand=['line_items']
                 )
 
-                price = session_with_items.line_items.data[0].price
-                product_id = price.product
-                product = stripe.Product.retrieve(product_id)
                 customer = stripe.Customer.retrieve(session.customer)
                 user = get_user_by_email(customer.email, db)
+                transactions = []
+
+                # Track maximum validity days from all products
+                max_validity_days = 0
+
+                # First validate no mixing of trial and regular products
+                has_trial = False
+                has_regular = False
+                for line_item in session_with_items.line_items.data:
+                    product = stripe.Product.retrieve(line_item.price.product)
+                    if product.metadata.get('type', '').lower() == 'trial':
+                        has_trial = True
+                    else:
+                        has_regular = True
+                        # Track maximum validity days from regular products
+                        validity_days = int(product.metadata.get('validity_in_days', 90))
+                        max_validity_days = max(max_validity_days, validity_days)
+                    
+                    if has_trial and has_regular:
+                        raise ValueError("Cannot mix trial and regular products in the same checkout")
+
+                # Set new validity expiration date if this is a regular product purchase
+                if has_regular:
+                    new_expiration = datetime.utcnow() + timedelta(days=max_validity_days)
+                    user.validity_expiration = new_expiration
+
+                    # Find and reset trial credits if they exist
+                    trial_transactions = db.query(Transaction).filter(
+                        Transaction.user_id == user.id,
+                        Transaction.source_type == 'trial',
+                        Transaction.transaction_type == 'received'
+                    ).all()
+
+                    if trial_transactions:
+                        # Calculate total trial credits
+                        trial_test_cases = sum(t.value for t in trial_transactions if t.primary_type == 'test_case')
+                        trial_user_stories = sum(t.value for t in trial_transactions if t.primary_type == 'user_story')
+
+                        # Create reset transactions
+                        if trial_test_cases > 0:
+                            transactions.append(
+                                Transaction(
+                                    user_id=user.id,
+                                    primary_type='test_case',
+                                    source_type='trial',
+                                    transaction_type='reset',
+                                    value=-trial_test_cases,  # Negative value to indicate reduction
+                                    payment_id=session.id,
+                                    description="Reset trial test case credits"
+                                )
+                            )
+                            user.current_test_case -= trial_test_cases
+
+                        if trial_user_stories > 0:
+                            transactions.append(
+                                Transaction(
+                                    user_id=user.id,
+                                    primary_type='user_story',
+                                    source_type='trial',
+                                    transaction_type='reset',
+                                    value=-trial_user_stories,  # Negative value to indicate reduction
+                                    payment_id=session.id,
+                                    description="Reset trial user story credits"
+                                )
+                            )
+                            user.current_user_story -= trial_user_stories
+
+                # Now process all line items
+                for line_item in session_with_items.line_items.data:
+                    price = line_item.price
+                    product = stripe.Product.retrieve(price.product)
+                    product_type = product.metadata.get('type', '').lower()
+                    
+                    if product_type == 'trial':
+                        # Handle trial products
+                        trial_days = int(product.metadata.get('expiration_in_days', 0))
+                        trial_end = datetime.utcnow() + timedelta(days=trial_days)
+                        
+                        user.has_used_trial = True
+                        user.trial_end_date = trial_end
+
+                        test_case = int(product.metadata.get('test_case', 0))
+                        user_story = int(product.metadata.get('user_story', 0))
+                        
+                        transactions.extend([
+                            Transaction(
+                                user_id=user.id,
+                                primary_type='test_case',
+                                source_type='trial',
+                                transaction_type='received',
+                                value=test_case,
+                                payment_id=session.id,
+                                description=f"Trial plan test case credits"
+                            ),
+                            Transaction(
+                                user_id=user.id,
+                                primary_type='user_story',
+                                source_type='trial',
+                                transaction_type='received',
+                                value=user_story,
+                                payment_id=session.id,
+                                description=f"Trial plan user story credits"
+                            )
+                        ])
+                        
+                        user.current_test_case += test_case
+                        user.current_user_story += user_story
+
+                    else:
+                        # Handle regular products
+                        # Note: validity_expiration is already handled above
+                        quantity = int(line_item.quantity)
+                        bundle_type = product.metadata.get('bundle_type', 'basic')
+                    
+                        # Create transaction based on bundle type
+                        bundle_type = product.metadata.get('bundle_type', '').lower()
+                        if bundle_type == 'test_case':
+                            transactions.append(
+                                Transaction(
+                                    user_id=user.id,
+                                    primary_type='test_case',
+                                    source_type='top_up',
+                                    transaction_type='received',
+                                    value=quantity,
+                                    payment_id=session.id,
+                                    description=f"Test case bundle credits"
+                                )
+                            )
+                            user.current_test_case += quantity
+                        elif bundle_type == 'user_story':
+                            transactions.append(
+                                Transaction(
+                                    user_id=user.id,
+                                    primary_type='user_story',
+                                    source_type='top_up',
+                                    transaction_type='received',
+                                    value=quantity,
+                                    payment_id=session.id,
+                                    description=f"User story bundle credits"
+                                )
+                            )
+                            user.current_user_story += quantity
+                        else:
+                            raise ValueError(f"Unknown bundle type: {bundle_type}")
+
+                # Add all transactions
+                for transaction in transactions:
+                    db.add(transaction)
                 
-                if product.metadata.get('type') == 'trial':
-                    trial_days = int(product.metadata.get('expiration_in_days', 0))
-                    trial_end = datetime.utcnow() + timedelta(days=trial_days)
-                    
-                    user.has_used_trial = True
-                    user.trial_end_date = trial_end
-                    
-                    credits = int(product.metadata.get('base_credits', 0))
-                    scans = int(product.metadata.get('base_scans', 0))
-                    
-                    # Transaction for credits
-                    credit_transaction = Transaction(
-                        user_id=user.id,
-                        primary_type='credit',
-                        source_type='trial',
-                        transaction_type='received',
-                        value=credits,
-                        payment_id=session.id,
-                        description="Trial plan credits"
-                    )
-                    db.add(credit_transaction)
-                    
-                    # Transaction for scans
-                    scan_transaction = Transaction(
-                        user_id=user.id,
-                        primary_type='scan',
-                        source_type='trial',
-                        transaction_type='received',
-                        value=scans,
-                        payment_id=session.id,
-                        description="Trial plan scans"
-                    )
-                    db.add(scan_transaction)
-                    
-                    user.current_credits = credits
-                    user.current_scans = scans
-                    user.max_users = int(product.metadata.get('users', 0))
-
-                elif product.metadata.get('type') == 'top_up':
-                    quantity = int(price.metadata.get('quantity', 0))
-                    if product.metadata.get('top_up_type') == 'credit':
-                        user.current_credits += quantity
-                        
-                        credit_transaction = Transaction(
-                            user_id=user.id,
-                            primary_type='credit',
-                            source_type='top_up',
-                            transaction_type='received',
-                            value=quantity,
-                            payment_id=session.id,
-                            description="Credit top-up"
-                        )
-                        db.add(credit_transaction)
-                        
-                    elif product.metadata.get('top_up_type') == 'scan':
-                        user.current_scans += quantity
-                        
-                        scan_transaction = Transaction(
-                            user_id=user.id,
-                            primary_type='scan',
-                            source_type='top_up',
-                            transaction_type='received',
-                            value=quantity,
-                            payment_id=session.id,
-                            description="Scan top-up"
-                        )
-                        db.add(scan_transaction)
-
                 db.commit()
 
-                
-
-        # for catching the buying of subscription as well as renewal.
-        elif event['type'] == 'invoice.paid':
-            invoice = event['data']['object']
-            subscription_id = invoice.get('subscription')
-            
-            if subscription_id:
-                subscription = stripe.Subscription.retrieve(subscription_id)
-                product = stripe.Product.retrieve(subscription.plan.product)
-                customer = stripe.Customer.retrieve(invoice.customer)
-                user = get_user_by_email(customer.email, db)
-                
-                # Get subscription details
-                is_yearly = subscription.plan.interval == 'year'
-                credits_key = 'base_credits_yearly' if is_yearly else 'base_credits_monthly'
-                scans_key = 'base_scans_yearly' if is_yearly else 'base_scans_monthly'
-                
-                credits = int(product.metadata.get(credits_key, 0))
-                scans = int(product.metadata.get(scans_key, 0))
-
-                # Check if this is a subscription renewal
-                is_renewal = invoice.get('billing_reason') == 'subscription_cycle'
-                
-                if is_renewal and user.stripe_subscription_id == subscription_id:
-                    print(f"Processing subscription renewal for user {user.email}")
-                    print(f"Previous credits: {user.current_credits}, Previous scans: {user.current_scans}")
-                    
-                    # Create transactions for renewal credits and scans
-                    credit_transaction = Transaction(
-                        user_id=user.id,
-                        primary_type='credit',
-                        source_type='subscription',
-                        transaction_type='received',
-                        value=credits,
-                        subscription_id=subscription_id,
-                        description=f'Renewal credits for {product.name} subscription'
-                    )
-                    db.add(credit_transaction)
-                    
-                    scan_transaction = Transaction(
-                        user_id=user.id,
-                        primary_type='scan',
-                        source_type='subscription',
-                        transaction_type='received',
-                        value=scans,
-                        subscription_id=subscription_id,
-                        description=f'Renewal scans for {product.name} subscription'
-                    )
-                    db.add(scan_transaction)
-                    
-                    # Add new values to existing ones
-                    user.current_credits += credits
-                    user.current_scans += scans
-                    
-                    print(f"New totals - Credits: {user.current_credits}, Scans: {user.current_scans}")
-
-                elif user.is_blocked:
-                    # For blocked users, add new credits/scans to existing ones
-                    print(f"Resubscription for blocked user {user.email}")
-                    print(f"Previous credits: {user.current_credits}, Previous scans: {user.current_scans}")
-                    
-                    # Create transactions for additional credits and scans
-                    credit_transaction = Transaction(
-                        user_id=user.id,
-                        primary_type='credit',
-                        source_type='subscription',
-                        transaction_type='received',
-                        value=credits,
-                        subscription_id=subscription_id,
-                        description=f'Additional credits from resubscription to {product.name}'
-                    )
-                    db.add(credit_transaction)
-                    
-                    scan_transaction = Transaction(
-                        user_id=user.id,
-                        primary_type='scan',
-                        source_type='subscription',
-                        transaction_type='received',
-                        value=scans,
-                        subscription_id=subscription_id,
-                        description=f'Additional scans from resubscription to {product.name}'
-                    )
-                    db.add(scan_transaction)
-                    
-                    # Add new values to existing ones
-                    user.current_credits += credits
-                    user.current_scans += scans
-                    user.max_users = int(product.metadata.get('users', 0))
-                    
-                    # Reset blocked status
-                    user.is_blocked = False
-                    user.benefits_end_date = None
-                    user.stripe_subscription_id = subscription_id
-                    
-                    print(f"New totals - Credits: {user.current_credits}, Scans: {user.current_scans}")
-
-                elif not user.stripe_subscription_id or invoice.get('billing_reason') == 'subscription_create':
-                    # Brand new subscription
-                    print(f"New subscription for user {user.email}")
-                    
-                    # If transitioning from trial, create reset transactions
-                    if user.has_used_trial:
-                        credit_reset_transaction = Transaction(
-                            user_id=user.id,
-                            primary_type='credit',
-                            source_type='subscription',
-                            transaction_type='reset',
-                            value=user.current_credits,
-                            subscription_id=subscription_id,
-                            description='Reset credits from trial to subscription'
-                        )
-                        db.add(credit_reset_transaction)
-
-                        scan_reset_transaction = Transaction(
-                            user_id=user.id,
-                            primary_type='scan',
-                            source_type='subscription',
-                            transaction_type='reset',
-                            value=user.current_scans,
-                            subscription_id=subscription_id,
-                            description='Reset scans from trial to subscription'
-                        )
-                        db.add(scan_reset_transaction)
-                    
-                    # Create transactions for initial credits and scans
-                    credit_transaction = Transaction(
-                        user_id=user.id,
-                        primary_type='credit',
-                        source_type='subscription',
-                        transaction_type='received',
-                        value=credits,
-                        subscription_id=subscription_id,
-                        description=f'Initial credits for {product.name} subscription'
-                    )
-                    db.add(credit_transaction)
-                    
-                    scan_transaction = Transaction(
-                        user_id=user.id,
-                        primary_type='scan',
-                        source_type='subscription',
-                        transaction_type='received',
-                        value=scans,
-                        subscription_id=subscription_id,
-                        description=f'Initial scans for {product.name} subscription'
-                    )
-                    db.add(scan_transaction)
-                    
-                    # Set initial values
-                    user.current_credits = credits
-                    user.current_scans = scans
-                    user.max_users = int(product.metadata.get('users', 0))
-                    user.stripe_subscription_id = subscription_id
-                    user.has_used_trial = True
-                    user.trial_end_date = None
-                
-                db.commit()
-                print(f"Successfully processed subscription update for user {user.email}")
-
-        # catch the subscription updated .
-        elif event['type'] == 'customer.subscription.updated':
-            subscription = event['data']['object']
-            previous_attributes = event['data']['previous_attributes']
-            
-            # Only process price updates
-            if 'items' in previous_attributes and 'data' in previous_attributes['items']:
-                # Get customer and user
-                customer_id = subscription['customer']
-                customer = stripe.Customer.retrieve(customer_id)
-                user = get_user_by_email(customer.email, db)
-                
-                if not user:
-                    raise Exception(f"User not found for customer {customer_id}")
-                
-                # Get the new product details
-                new_price_id = subscription['items']['data'][0]['price']['id']
-                new_price = stripe.Price.retrieve(new_price_id)
-                new_product = stripe.Product.retrieve(new_price['product'])
-                
-                # Get the old product details
-                old_price_id = previous_attributes['items']['data'][0]['price']['id']
-                old_price = stripe.Price.retrieve(old_price_id)
-                old_product = stripe.Product.retrieve(old_price['product'])
-                
-                # Determine if it's monthly or yearly subscription
-                is_yearly = subscription['items']['data'][0]['plan']['interval'] == 'year'
-                credits_key = 'base_credits_yearly' if is_yearly else 'base_credits_monthly'
-                scans_key = 'base_scans_yearly' if is_yearly else 'base_scans_monthly'
-                
-                # Get new limits from product metadata
-                new_credits = int(new_product.metadata.get(credits_key, 0))
-                new_scans = int(new_product.metadata.get(scans_key, 0))
-                new_max_users = int(new_product.metadata.get('users', 0))
-                
-                # Create transactions for additional credits and scans
-                credit_transaction = Transaction(
-                    user_id=user.id,
-                    primary_type='credit',
-                    source_type='subscription',
-                    transaction_type='received',
-                    value=new_credits,
-                    subscription_id=subscription.id,
-                    description=f'Additional credits from upgrade: {old_product.name} to {new_product.name}'
-                )
-                db.add(credit_transaction)
-                
-                scan_transaction = Transaction(
-                    user_id=user.id,
-                    primary_type='scan',
-                    source_type='subscription',
-                    transaction_type='received',
-                    value=new_scans,
-                    subscription_id=subscription.id,
-                    description=f'Additional scans from upgrade: {old_product.name} to {new_product.name}'
-                )
-                db.add(scan_transaction)
-                
-                # Add new values to existing credits and scans
-                user.current_credits += new_credits
-                user.current_scans += new_scans
-                user.max_users = new_max_users 
-                
-                db.commit()
-                print(f"Successfully processed subscription upgrade for user {user.email}")
-                print(f"Previous credits: {user.current_credits - new_credits}, Previous scans: {user.current_scans - new_scans}")
-                print(f"Added credits: {new_credits}, Added scans: {new_scans}")
-                print(f"New totals - Credits: {user.current_credits}, Scans: {user.current_scans}, Max Users: {new_max_users}")
-
-        # catch subscription deleted.
-        elif event['type'] == 'customer.subscription.deleted':
-            subscription = event['data']['object']
-            
-            # Get customer and user
-            customer_id = subscription['customer']
-            customer = stripe.Customer.retrieve(customer_id)
-            user = get_user_by_email(customer.email, db)
-            
-            if not user:
-                raise Exception(f"User not found for customer {customer_id}")
-            
-            # Set blocked status and benefits end date (3 months from now)
-            user.is_blocked = True
-            user.benefits_end_date = datetime.utcnow() + timedelta(days=90)  # 3 months
-            
-            print(f"Subscription cancelled for user {user.email}. Benefits will expire on {user.benefits_end_date}")
-            db.commit()    
         return jsonify({'status': 'success'}), 200
         
     except Exception as e:
         db.rollback()
         print(f"Error processing event: {e}")
-        return jsonify({'error': (e)}), 500
+        return jsonify({'error': str(e)}), 500
     finally:
         db.close()
-
 @app.route('/api/test/emails', methods=['POST'])
 def test_emails():
     try:
@@ -1059,3 +973,251 @@ if __name__ == '__main__':
 #     except Exception as e:
 #         print(f"Error in create_subscription_invoice: {str(e)}")
 #         return jsonify({"error": str(e)}), 500
+
+
+
+
+        # elif event['type'] == 'invoice.paid':
+        #     invoice = event['data']['object']
+        #     subscription_id = invoice.get('subscription')
+            
+        #     if subscription_id:
+        #         subscription = stripe.Subscription.retrieve(subscription_id)
+        #         product = stripe.Product.retrieve(subscription.plan.product)
+        #         customer = stripe.Customer.retrieve(invoice.customer)
+        #         user = get_user_by_email(customer.email, db)
+                
+        #         # Get subscription details
+        #         is_yearly = subscription.plan.interval == 'year'
+        #         credits_key = 'base_credits_yearly' if is_yearly else 'base_credits_monthly'
+        #         scans_key = 'base_scans_yearly' if is_yearly else 'base_scans_monthly'
+                
+        #         credits = int(product.metadata.get(credits_key, 0))
+        #         scans = int(product.metadata.get(scans_key, 0))
+
+        #         # Check if this is a subscription renewal
+        #         is_renewal = invoice.get('billing_reason') == 'subscription_cycle'
+                
+        #         if is_renewal and user.stripe_subscription_id == subscription_id:
+        #             print(f"Processing subscription renewal for user {user.email}")
+        #             print(f"Previous credits: {user.current_credits}, Previous scans: {user.current_scans}")
+                    
+        #             # Create transactions for renewal credits and scans
+        #             credit_transaction = Transaction(
+        #                 user_id=user.id,
+        #                 primary_type='credit',
+        #                 source_type='subscription',
+        #                 transaction_type='received',
+        #                 value=credits,
+        #                 subscription_id=subscription_id,
+        #                 description=f'Renewal credits for {product.name} subscription'
+        #             )
+        #             db.add(credit_transaction)
+                    
+        #             scan_transaction = Transaction(
+        #                 user_id=user.id,
+        #                 primary_type='scan',
+        #                 source_type='subscription',
+        #                 transaction_type='received',
+        #                 value=scans,
+        #                 subscription_id=subscription_id,
+        #                 description=f'Renewal scans for {product.name} subscription'
+        #             )
+        #             db.add(scan_transaction)
+                    
+        #             # Add new values to existing ones
+        #             user.current_credits += credits
+        #             user.current_scans += scans
+                    
+        #             print(f"New totals - Credits: {user.current_credits}, Scans: {user.current_scans}")
+
+        #         elif user.is_blocked:
+        #             # For blocked users, add new credits/scans to existing ones
+        #             print(f"Resubscription for blocked user {user.email}")
+        #             print(f"Previous credits: {user.current_credits}, Previous scans: {user.current_scans}")
+                    
+        #             # Create transactions for additional credits and scans
+        #             credit_transaction = Transaction(
+        #                 user_id=user.id,
+        #                 primary_type='credit',
+        #                 source_type='subscription',
+        #                 transaction_type='received',
+        #                 value=credits,
+        #                 subscription_id=subscription_id,
+        #                 description=f'Additional credits from resubscription to {product.name}'
+        #             )
+        #             db.add(credit_transaction)
+                    
+        #             scan_transaction = Transaction(
+        #                 user_id=user.id,
+        #                 primary_type='scan',
+        #                 source_type='subscription',
+        #                 transaction_type='received',
+        #                 value=scans,
+        #                 subscription_id=subscription_id,
+        #                 description=f'Additional scans from resubscription to {product.name}'
+        #             )
+        #             db.add(scan_transaction)
+                    
+        #             # Add new values to existing ones
+        #             user.current_credits += credits
+        #             user.current_scans += scans
+        #             user.max_users = int(product.metadata.get('users', 0))
+                    
+        #             # Reset blocked status
+        #             user.is_blocked = False
+        #             user.benefits_end_date = None
+        #             user.stripe_subscription_id = subscription_id
+                    
+        #             print(f"New totals - Credits: {user.current_credits}, Scans: {user.current_scans}")
+
+        #         elif not user.stripe_subscription_id or invoice.get('billing_reason') == 'subscription_create':
+        #             # Brand new subscription
+        #             print(f"New subscription for user {user.email}")
+                    
+        #             # If transitioning from trial, create reset transactions
+        #             if user.has_used_trial:
+        #                 credit_reset_transaction = Transaction(
+        #                     user_id=user.id,
+        #                     primary_type='credit',
+        #                     source_type='subscription',
+        #                     transaction_type='reset',
+        #                     value=user.current_credits,
+        #                     subscription_id=subscription_id,
+        #                     description='Reset credits from trial to subscription'
+        #                 )
+        #                 db.add(credit_reset_transaction)
+
+        #                 scan_reset_transaction = Transaction(
+        #                     user_id=user.id,
+        #                     primary_type='scan',
+        #                     source_type='subscription',
+        #                     transaction_type='reset',
+        #                     value=user.current_scans,
+        #                     subscription_id=subscription_id,
+        #                     description='Reset scans from trial to subscription'
+        #                 )
+        #                 db.add(scan_reset_transaction)
+                    
+        #             # Create transactions for initial credits and scans
+        #             credit_transaction = Transaction(
+        #                 user_id=user.id,
+        #                 primary_type='credit',
+        #                 source_type='subscription',
+        #                 transaction_type='received',
+        #                 value=credits,
+        #                 subscription_id=subscription_id,
+        #                 description=f'Initial credits for {product.name} subscription'
+        #             )
+        #             db.add(credit_transaction)
+                    
+        #             scan_transaction = Transaction(
+        #                 user_id=user.id,
+        #                 primary_type='scan',
+        #                 source_type='subscription',
+        #                 transaction_type='received',
+        #                 value=scans,
+        #                 subscription_id=subscription_id,
+        #                 description=f'Initial scans for {product.name} subscription'
+        #             )
+        #             db.add(scan_transaction)
+                    
+        #             # Set initial values
+        #             user.current_credits = credits
+        #             user.current_scans = scans
+        #             user.max_users = int(product.metadata.get('users', 0))
+        #             user.stripe_subscription_id = subscription_id
+        #             user.has_used_trial = True
+        #             user.trial_end_date = None
+                
+        #         db.commit()
+        #         print(f"Successfully processed subscription update for user {user.email}")
+
+        # # catch the subscription updated .
+        # elif event['type'] == 'customer.subscription.updated':
+        #     subscription = event['data']['object']
+        #     previous_attributes = event['data']['previous_attributes']
+            
+        #     # Only process price updates
+        #     if 'items' in previous_attributes and 'data' in previous_attributes['items']:
+        #         # Get customer and user
+        #         customer_id = subscription['customer']
+        #         customer = stripe.Customer.retrieve(customer_id)
+        #         user = get_user_by_email(customer.email, db)
+                
+        #         if not user:
+        #             raise Exception(f"User not found for customer {customer_id}")
+                
+        #         # Get the new product details
+        #         new_price_id = subscription['items']['data'][0]['price']['id']
+        #         new_price = stripe.Price.retrieve(new_price_id)
+        #         new_product = stripe.Product.retrieve(new_price['product'])
+                
+        #         # Get the old product details
+        #         old_price_id = previous_attributes['items']['data'][0]['price']['id']
+        #         old_price = stripe.Price.retrieve(old_price_id)
+        #         old_product = stripe.Product.retrieve(old_price['product'])
+                
+        #         # Determine if it's monthly or yearly subscription
+        #         is_yearly = subscription['items']['data'][0]['plan']['interval'] == 'year'
+        #         credits_key = 'base_credits_yearly' if is_yearly else 'base_credits_monthly'
+        #         scans_key = 'base_scans_yearly' if is_yearly else 'base_scans_monthly'
+                
+        #         # Get new limits from product metadata
+        #         new_credits = int(new_product.metadata.get(credits_key, 0))
+        #         new_scans = int(new_product.metadata.get(scans_key, 0))
+        #         new_max_users = int(new_product.metadata.get('users', 0))
+                
+        #         # Create transactions for additional credits and scans
+        #         credit_transaction = Transaction(
+        #             user_id=user.id,
+        #             primary_type='credit',
+        #             source_type='subscription',
+        #             transaction_type='received',
+        #             value=new_credits,
+        #             subscription_id=subscription.id,
+        #             description=f'Additional credits from upgrade: {old_product.name} to {new_product.name}'
+        #         )
+        #         db.add(credit_transaction)
+                
+        #         scan_transaction = Transaction(
+        #             user_id=user.id,
+        #             primary_type='scan',
+        #             source_type='subscription',
+        #             transaction_type='received',
+        #             value=new_scans,
+        #             subscription_id=subscription.id,
+        #             description=f'Additional scans from upgrade: {old_product.name} to {new_product.name}'
+        #         )
+        #         db.add(scan_transaction)
+                
+        #         # Add new values to existing credits and scans
+        #         user.current_credits += new_credits
+        #         user.current_scans += new_scans
+        #         user.max_users = new_max_users 
+                
+        #         db.commit()
+        #         print(f"Successfully processed subscription upgrade for user {user.email}")
+        #         print(f"Previous credits: {user.current_credits - new_credits}, Previous scans: {user.current_scans - new_scans}")
+        #         print(f"Added credits: {new_credits}, Added scans: {new_scans}")
+        #         print(f"New totals - Credits: {user.current_credits}, Scans: {user.current_scans}, Max Users: {new_max_users}")
+
+        # # catch subscription deleted.
+        # elif event['type'] == 'customer.subscription.deleted':
+        #     subscription = event['data']['object']
+            
+        #     # Get customer and user
+        #     customer_id = subscription['customer']
+        #     customer = stripe.Customer.retrieve(customer_id)
+        #     user = get_user_by_email(customer.email, db)
+            
+        #     if not user:
+        #         raise Exception(f"User not found for customer {customer_id}")
+            
+        #     # Set blocked status and benefits end date (3 months from now)
+        #     user.is_blocked = True
+        #     user.benefits_end_date = datetime.utcnow() + timedelta(days=90)  # 3 months
+            
+        #     print(f"Subscription cancelled for user {user.email}. Benefits will expire on {user.benefits_end_date}")
+        #     db.commit()    
+        
