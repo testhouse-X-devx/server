@@ -295,6 +295,104 @@ def format_currency(amount, currency):
 def get_user_by_email(email: str, db: Session):
    return db.query(User).filter(User.email == email).first()
 
+def validate_product_combination(items):
+    """
+    Validate that trial and regular products are not mixed.
+    Returns a tuple of (is_valid, error_message, has_trial, has_regular, bundle_quantities)
+    """
+    try:
+        has_trial = False
+        has_regular = False
+        bundle_quantities = {
+            'test_case': 0,
+            'user_story': 0
+        }
+        
+        # Fetch all prices and their associated products
+        for item in items:
+            price_id = item.get('priceId')
+            if not price_id:
+                continue
+                
+            # Get price and its associated product
+            price = stripe.Price.retrieve(price_id, expand=['product'])
+            if not price.product:
+                continue
+                
+            # Check product type from metadata
+            is_trial = price.product.metadata.get('type', '').lower() == 'trial'
+            
+            if is_trial:
+                has_trial = True
+            else:
+                has_regular = True
+                # Collect quantities for each bundle type
+                bundle_type = price.product.metadata.get('bundle_type', '').lower()
+                if bundle_type in bundle_quantities:
+                    bundle_quantities[bundle_type] += item.get('credits', 0)
+            
+            if has_trial and has_regular:
+                return (
+                    False, 
+                    'Cannot combine trial plans with regular plans. Please select either a trial plan or regular plans.',
+                    has_trial,
+                    has_regular,
+                    bundle_quantities
+                )
+
+        return (True, None, has_trial, has_regular, bundle_quantities)
+
+    except stripe.error.StripeError as e:
+        return (False, f'Error validating plans: {str(e)}', False, False, bundle_quantities)
+
+def find_matching_subscription_product(bundle_quantities):
+    """Find existing subscription product with matching metadata."""
+    products = stripe.Product.list(
+        active=True,
+        limit=100
+    )
+    
+    for product in products.data:
+        if (product.metadata.get('type') == 'subscription' and
+            product.metadata.get('test_case') == str(bundle_quantities['test_case']) and
+            product.metadata.get('user_story') == str(bundle_quantities['user_story']) and
+            product.metadata.get('interval') == '3_month'):
+            return product
+            
+    return None
+
+def generate_subscription_product_name(bundle_quantities):
+    """Generate a descriptive name for the subscription product."""
+    parts = []
+    if bundle_quantities['test_case']:
+        parts.append(f"{bundle_quantities['test_case']} Test Cases")
+    if bundle_quantities['user_story']:
+        parts.append(f"{bundle_quantities['user_story']} User Stories")
+    
+    return f"3-Month Subscription: {' + '.join(parts)}"
+
+def calculate_subscription_price(items):
+    """Calculate subscription price based on original bundle prices and quantities."""
+    total_amount = 0
+    
+    for item in items:
+        price_id = item.get('priceId')
+        quantity = item.get('credits', 0)
+        
+        if price_id and quantity:
+            # Get original price info
+            price = stripe.Price.retrieve(price_id)
+            
+            # Get base units from transform_quantity
+            base_units = price.transform_quantity.get('divide_by') if price.transform_quantity else 1
+            base_unit_amount = price.unit_amount / base_units
+            
+            # Calculate amount for this bundle
+            bundle_amount = base_unit_amount * quantity
+            total_amount += bundle_amount
+    
+    return int(total_amount)  # Ensure we return an integer amount in cents
+
 @app.route('/api/create-checkout-session', methods=['POST'])
 def create_checkout_session():
     db = SessionLocal()
@@ -302,6 +400,7 @@ def create_checkout_session():
         data = request.get_json()
         email = data.get('email')
         items = data.get('items', [])  # Array of {priceId, credits}
+        is_subscription = data.get('isSubscription', False)
         country_code = 'GB'
 
         if not email:
@@ -311,37 +410,15 @@ def create_checkout_session():
             return jsonify({'error': 'No items selected'}), 400
 
         # Validate plan combination
-        try:
-            has_trial = False
-            has_regular = False
-            
-            # Fetch all prices and their associated products
-            for item in items:
-                price_id = item.get('priceId')
-                if not price_id:
-                    continue
-                    
-                # Get price and its associated product
-                price = stripe.Price.retrieve(price_id, expand=['product'])
-                if not price.product:
-                    continue
-                    
-                # Check product type from metadata
-                is_trial = price.product.metadata.get('type', '').lower() == 'trial'
-                
-                if is_trial:
-                    has_trial = True
-                else:
-                    has_regular = True
-                
-                # If we find both types, return error
-                if has_trial and has_regular:
-                    return jsonify({
-                        'error': 'Cannot combine trial plans with regular plans. Please select either a trial plan or regular plans.'
-                    }), 400
+        is_valid, error_message, has_trial, has_regular, bundle_quantities = validate_product_combination(items)
+        
+        if not is_valid:
+            return jsonify({'error': error_message}), 400
 
-        except stripe.error.StripeError as e:
-            return jsonify({'error': f'Error validating plans: {str(e)}'}), 400
+        if has_trial and is_subscription:
+            return jsonify({
+                'error': 'Trial plans cannot be converted to subscriptions.'
+            }), 400
 
         # Get or create user
         user = get_user_by_email(email, db)
@@ -358,43 +435,92 @@ def create_checkout_session():
             user.stripe_customer_id = customer.id
             db.commit()
 
-        # Create line items for checkout
-        line_items = []
-        metadata = {}
-        
-        for item in items:
-            price_id = item.get('priceId')
-            credits = item.get('credits')  # Get credits to use as quantity
+        if is_subscription:
+            # First, check if a matching subscription product exists
+            existing_product = find_matching_subscription_product(bundle_quantities)
             
-            if price_id and credits:
-                if isinstance(credits, dict):  # Handle trial plan credits
-                    # For trial plans, we store the specific credit types in metadata
-                    metadata['test_case_credits'] = credits.get('test_case', 0)
-                    metadata['user_story_credits'] = credits.get('user_story', 0)
-                    # Use 1 as quantity for trial plans since they're one-time
-                    line_items.append({
-                        'price': price_id,
-                        'quantity': 1
-                    })
-                else:
-                    line_items.append({
-                        'price': price_id,
-                        'quantity': credits
-                    })
+            if not existing_product:
+                # Create new subscription product with metadata
+                product_name = generate_subscription_product_name(bundle_quantities)
+                product = stripe.Product.create(
+                    name=product_name,
+                    metadata={
+                        'type': 'subscription',
+                        'test_case': str(bundle_quantities['test_case']),
+                        'user_story': str(bundle_quantities['user_story']),
+                        'interval': '3_month'
+                    }
+                )
+                
+                # Create recurring price for the product
+                price = stripe.Price.create(
+                    product=product.id,
+                    unit_amount=calculate_subscription_price(items),
+                    currency=get_currency_for_country(country_code).lower(),
+                    recurring={
+                        'interval': 'month',
+                        'interval_count': 3
+                    }
+                )
+            else:
+                # Get existing price for the product
+                prices = stripe.Price.list(
+                    product=existing_product.id,
+                    active=True,
+                    limit=1
+                )
+                price = prices.data[0]
 
-        # Create checkout session
-        checkout_session = stripe.checkout.Session.create(
-            customer=user.stripe_customer_id,
-            payment_method_types=['card'],
-            line_items=line_items,
-            mode='payment',
-            currency=get_currency_for_country(country_code).lower(),
-            success_url=f"{request.headers.get('Origin', 'http://localhost:5173')}/success?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{request.headers.get('Origin', 'http://localhost:5173')}/cancel",
-            allow_promotion_codes=True,
-            expand=['line_items'],
-            metadata=metadata  # Add metadata for trial plan credits
-        )
+            # Create subscription checkout session
+            checkout_session = stripe.checkout.Session.create(
+                customer=user.stripe_customer_id,
+                payment_method_types=['card'],
+                line_items=[{
+                    'price': price.id,
+                    'quantity': 1
+                }],
+                mode='subscription',
+                currency=get_currency_for_country(country_code).lower(),
+                success_url=f"{request.headers.get('Origin', 'http://localhost:5173')}/success?session_id={{CHECKOUT_SESSION_ID}}",
+                cancel_url=f"{request.headers.get('Origin', 'http://localhost:5173')}/cancel",
+                allow_promotion_codes=True,
+                
+            )
+        else:
+            # Regular one-time payment checkout
+            line_items = []
+            metadata = {}
+            
+            for item in items:
+                price_id = item.get('priceId')
+                credits = item.get('credits')
+                
+                if price_id and credits:
+                    if isinstance(credits, dict):  # Trial plan
+                        metadata['test_case_credits'] = credits.get('test_case', 0)
+                        metadata['user_story_credits'] = credits.get('user_story', 0)
+                        line_items.append({
+                            'price': price_id,
+                            'quantity': 1
+                        })
+                    else:
+                        line_items.append({
+                            'price': price_id,
+                            'quantity': credits
+                        })
+
+            checkout_session = stripe.checkout.Session.create(
+                customer=user.stripe_customer_id,
+                payment_method_types=['card'],
+                line_items=line_items,
+                mode='payment',
+                currency=get_currency_for_country(country_code).lower(),
+                success_url=f"{request.headers.get('Origin', 'http://localhost:5173')}/success?session_id={{CHECKOUT_SESSION_ID}}",
+                cancel_url=f"{request.headers.get('Origin', 'http://localhost:5173')}/cancel",
+                allow_promotion_codes=True,
+                metadata=metadata,
+                
+            )
 
         return jsonify({
             'sessionId': checkout_session.id,
@@ -403,10 +529,302 @@ def create_checkout_session():
 
     except Exception as e:
         db.rollback()
+        print(f"Error in create_checkout_session: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
+        
+@app.route('/api/subscription', methods=['GET'])
+def get_customer_subscription():
+    db = SessionLocal()
+    try:
+        email = request.args.get('email')
+        if not email:
+            return jsonify({'error': 'Email is required'}), 400
+
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+
+        if not user.stripe_subscription_id:
+            return jsonify({'subscription': None}), 200
+
+        try:
+            subscription = stripe.Subscription.retrieve(
+                user.stripe_subscription_id
+            )
+
+            subscription_data = {
+                'id': subscription.id,
+                'status': subscription.status,
+                'current_period_end': subscription.current_period_end,
+                'current_period_start': subscription.current_period_start,
+                'cancel_at_period_end': subscription.cancel_at_period_end,
+                'default_payment_method': subscription.default_payment_method,
+                'price': {
+                    'amount': subscription.plan.amount / 100,
+                    'currency': subscription.plan.currency.upper(),
+                    'interval': subscription.plan.interval,
+                    'interval_count': subscription.plan.interval_count
+                }
+            }
+
+            return jsonify({
+                'subscription': subscription_data
+            }), 200
+
+        except stripe.error.InvalidRequestError as e:
+            if 'No such subscription' in str(e):
+                user.stripe_subscription_id = None
+                db.commit()
+                return jsonify({'subscription': None}), 200
+            raise e
+
+    except stripe.error.InvalidRequestError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        print(f"Error fetching subscription: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
+@app.route('/api/create-portal-session', methods=['POST'])
+def create_portal_session():
+    db = SessionLocal()
+    try:
+        data = request.get_json()
+        email = data.get('email')
+        
+        if not email:
+            return jsonify({'error': 'Email is required'}), 400
+
+        # Get user from database
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+
+        if not user.stripe_subscription_id:
+            return jsonify({'error': 'No subscription found for this user'}), 404
+
+        # Create billing portal session
+        session = stripe.billing_portal.Session.create(
+            customer=user.stripe_customer_id,
+            return_url=f"{request.headers.get('Origin', 'http://localhost:5173')}/subscriptions"
+        )
+
+        return jsonify({
+            'url': session.url
+        }), 200
+
+    except Exception as e:
+        print(f"Error creating portal session: {str(e)}")
         return jsonify({'error': str(e)}), 500
     finally:
         db.close()
 
+
+def reset_trial_credits(user, session_id, db):
+    """Reset trial credits and create reset transactions."""
+    trial_transactions = db.query(Transaction).filter(
+        Transaction.user_id == user.id,
+        Transaction.source_type == 'trial',
+        Transaction.transaction_type == 'received'
+    ).all()
+
+    transactions = []
+    if trial_transactions:
+        trial_test_cases = sum(t.value for t in trial_transactions if t.primary_type == 'test_case')
+        trial_user_stories = sum(t.value for t in trial_transactions if t.primary_type == 'user_story')
+
+        if trial_test_cases > 0:
+            transactions.append(
+                Transaction(
+                    user_id=user.id,
+                    primary_type='test_case',
+                    source_type='trial',
+                    transaction_type='reset',
+                    value=-trial_test_cases,
+                    payment_id=session_id,
+                    description="Reset trial test case credits"
+                )
+            )
+            user.current_test_case -= trial_test_cases
+
+        if trial_user_stories > 0:
+            transactions.append(
+                Transaction(
+                    user_id=user.id,
+                    primary_type='user_story',
+                    source_type='trial',
+                    transaction_type='reset',
+                    value=-trial_user_stories,
+                    payment_id=session_id,
+                    description="Reset trial user story credits"
+                )
+            )
+            user.current_user_story -= trial_user_stories
+
+    return transactions
+
+def process_trial_product(user, product, session_id):
+    """Process trial product purchase and return transactions."""
+    trial_days = int(product.metadata.get('expiration_in_days', 0))
+    trial_end = datetime.utcnow() + timedelta(days=trial_days)
+    
+    user.has_used_trial = True
+    user.trial_end_date = trial_end
+
+    test_case = int(product.metadata.get('test_case', 0))
+    user_story = int(product.metadata.get('user_story', 0))
+    
+    transactions = [
+        Transaction(
+            user_id=user.id,
+            primary_type='test_case',
+            source_type='trial',
+            transaction_type='received',
+            value=test_case,
+            payment_id=session_id,
+            description="Trial plan test case credits"
+        ),
+        Transaction(
+            user_id=user.id,
+            primary_type='user_story',
+            source_type='trial',
+            transaction_type='received',
+            value=user_story,
+            payment_id=session_id,
+            description="Trial plan user story credits"
+        )
+    ]
+    
+    user.current_test_case += test_case
+    user.current_user_story += user_story
+    
+    return transactions
+
+def process_bundle_product(user, product, quantity, session_id):
+    """Process bundle product purchase and return transaction."""
+    bundle_type = product.metadata.get('bundle_type', '').lower()
+    
+    user.has_used_trial = True
+    user.trial_end_date = None
+
+    if bundle_type == 'test_case':
+        transaction = Transaction(
+            user_id=user.id,
+            primary_type='test_case',
+            source_type='bundle',
+            transaction_type='received',
+            value=quantity,
+            payment_id=session_id,
+            description="Test case bundle credits"
+        )
+        user.current_test_case += quantity
+    elif bundle_type == 'user_story':
+        transaction = Transaction(
+            user_id=user.id,
+            primary_type='user_story',
+            source_type='bundle',
+            transaction_type='received',
+            value=quantity,
+            payment_id=session.id,
+            description="User story bundle credits"
+        )
+        user.current_user_story += quantity
+    else:
+        raise ValueError(f"Unknown bundle type: {bundle_type}")
+        
+    return [transaction]
+
+def handle_subscription_renewal(user, subscription_id, test_case_credits, user_story_credits):
+    """Handle subscription renewal and return transactions."""
+    transactions = [
+        Transaction(
+            user_id=user.id,
+            primary_type='test_case',
+            source_type='subscription',
+            transaction_type='received',
+            value=test_case_credits,
+            subscription_id=subscription_id,
+            description='Renewal test case credits for subscription'
+        ),
+        Transaction(
+            user_id=user.id,
+            primary_type='user_story',
+            source_type='subscription',
+            transaction_type='received',
+            value=user_story_credits,
+            subscription_id=subscription_id,
+            description='Renewal user story credits for subscription'
+        )
+    ]
+    
+    user.current_test_case += test_case_credits
+    user.current_user_story += user_story_credits
+    
+    return transactions
+
+def handle_new_subscription(user, subscription_id, test_case_credits, user_story_credits):
+    """Handle new subscription creation and return transactions."""
+    transactions = []
+    
+    # Reset trial credits if necessary
+    if user.has_used_trial:
+        if user.current_test_case > 0:
+            transactions.append(Transaction(
+                user_id=user.id,
+                primary_type='test_case',
+                source_type='trial',
+                transaction_type='reset',
+                value=-user.current_test_case,
+                subscription_id=subscription_id,
+                description='Reset test case credits from trial to subscription'
+            ))
+            user.current_test_case = 0
+
+        if user.current_user_story > 0:
+            transactions.append(Transaction(
+                user_id=user.id,
+                primary_type='user_story',
+                source_type='trial',
+                transaction_type='reset',
+                value=-user.current_user_story,
+                subscription_id=subscription_id,
+                description='Reset user story credits from trial to subscription'
+            ))
+            user.current_user_story = 0
+    
+    # Add subscription transactions
+    transactions.extend([
+        Transaction(
+            user_id=user.id,
+            primary_type='test_case',
+            source_type='subscription',
+            transaction_type='received',
+            value=test_case_credits,
+            subscription_id=subscription_id,
+            description='Initial test case credits for subscription'
+        ),
+        Transaction(
+            user_id=user.id,
+            primary_type='user_story',
+            source_type='subscription',
+            transaction_type='received',
+            value=user_story_credits,
+            subscription_id=subscription_id,
+            description='Initial user story credits for subscription'
+        )
+    ])
+    
+    # Update user properties
+    user.current_test_case = test_case_credits
+    user.current_user_story = user_story_credits
+    user.stripe_subscription_id = subscription_id
+    user.has_used_trial = True
+    user.trial_end_date = None
+    user.validity_expiration = datetime.utcnow() + timedelta(days=90)
+    
+    return transactions
 @app.route('/webhook', methods=['POST'])
 def webhook():
     db = SessionLocal()
@@ -433,148 +851,38 @@ def webhook():
                 user = get_user_by_email(customer.email, db)
                 transactions = []
 
-                # Track maximum validity days from all products
+                # Validate product mix and get max validity
                 max_validity_days = 0
-
-                # First validate no mixing of trial and regular products
                 has_trial = False
                 has_regular = False
+
                 for line_item in session_with_items.line_items.data:
                     product = stripe.Product.retrieve(line_item.price.product)
                     if product.metadata.get('type', '').lower() == 'trial':
                         has_trial = True
                     else:
                         has_regular = True
-                        # Track maximum validity days from regular products
                         validity_days = int(product.metadata.get('validity_in_days', 90))
                         max_validity_days = max(max_validity_days, validity_days)
                     
                     if has_trial and has_regular:
                         raise ValueError("Cannot mix trial and regular products in the same checkout")
 
-                # Set new validity expiration date if this is a regular product purchase
+                # Handle regular product validity and trial reset
                 if has_regular:
-                    new_expiration = datetime.utcnow() + timedelta(days=max_validity_days)
-                    user.validity_expiration = new_expiration
+                    user.validity_expiration = datetime.utcnow() + timedelta(days=max_validity_days)
+                    transactions.extend(reset_trial_credits(user, session.id, db))
 
-                    # Find and reset trial credits if they exist
-                    trial_transactions = db.query(Transaction).filter(
-                        Transaction.user_id == user.id,
-                        Transaction.source_type == 'trial',
-                        Transaction.transaction_type == 'received'
-                    ).all()
-
-                    if trial_transactions:
-                        # Calculate total trial credits
-                        trial_test_cases = sum(t.value for t in trial_transactions if t.primary_type == 'test_case')
-                        trial_user_stories = sum(t.value for t in trial_transactions if t.primary_type == 'user_story')
-
-                        # Create reset transactions
-                        if trial_test_cases > 0:
-                            transactions.append(
-                                Transaction(
-                                    user_id=user.id,
-                                    primary_type='test_case',
-                                    source_type='trial',
-                                    transaction_type='reset',
-                                    value=-trial_test_cases,  # Negative value to indicate reduction
-                                    payment_id=session.id,
-                                    description="Reset trial test case credits"
-                                )
-                            )
-                            user.current_test_case -= trial_test_cases
-
-                        if trial_user_stories > 0:
-                            transactions.append(
-                                Transaction(
-                                    user_id=user.id,
-                                    primary_type='user_story',
-                                    source_type='trial',
-                                    transaction_type='reset',
-                                    value=-trial_user_stories,  # Negative value to indicate reduction
-                                    payment_id=session.id,
-                                    description="Reset trial user story credits"
-                                )
-                            )
-                            user.current_user_story -= trial_user_stories
-
-                # Now process all line items
+                # Process each line item
                 for line_item in session_with_items.line_items.data:
-                    price = line_item.price
-                    product = stripe.Product.retrieve(price.product)
+                    product = stripe.Product.retrieve(line_item.price.product)
                     product_type = product.metadata.get('type', '').lower()
                     
                     if product_type == 'trial':
-                        # Handle trial products
-                        trial_days = int(product.metadata.get('expiration_in_days', 0))
-                        trial_end = datetime.utcnow() + timedelta(days=trial_days)
-                        
-                        user.has_used_trial = True
-                        user.trial_end_date = trial_end
-
-                        test_case = int(product.metadata.get('test_case', 0))
-                        user_story = int(product.metadata.get('user_story', 0))
-                        
-                        transactions.extend([
-                            Transaction(
-                                user_id=user.id,
-                                primary_type='test_case',
-                                source_type='trial',
-                                transaction_type='received',
-                                value=test_case,
-                                payment_id=session.id,
-                                description=f"Trial plan test case credits"
-                            ),
-                            Transaction(
-                                user_id=user.id,
-                                primary_type='user_story',
-                                source_type='trial',
-                                transaction_type='received',
-                                value=user_story,
-                                payment_id=session.id,
-                                description=f"Trial plan user story credits"
-                            )
-                        ])
-                        
-                        user.current_test_case += test_case
-                        user.current_user_story += user_story
-
+                        transactions.extend(process_trial_product(user, product, session.id))
                     else:
-                        # Handle regular products
-                        # Note: validity_expiration is already handled above
                         quantity = int(line_item.quantity)
-                        bundle_type = product.metadata.get('bundle_type', 'basic')
-                    
-                        # Create transaction based on bundle type
-                        bundle_type = product.metadata.get('bundle_type', '').lower()
-                        if bundle_type == 'test_case':
-                            transactions.append(
-                                Transaction(
-                                    user_id=user.id,
-                                    primary_type='test_case',
-                                    source_type='top_up',
-                                    transaction_type='received',
-                                    value=quantity,
-                                    payment_id=session.id,
-                                    description=f"Test case bundle credits"
-                                )
-                            )
-                            user.current_test_case += quantity
-                        elif bundle_type == 'user_story':
-                            transactions.append(
-                                Transaction(
-                                    user_id=user.id,
-                                    primary_type='user_story',
-                                    source_type='top_up',
-                                    transaction_type='received',
-                                    value=quantity,
-                                    payment_id=session.id,
-                                    description=f"User story bundle credits"
-                                )
-                            )
-                            user.current_user_story += quantity
-                        else:
-                            raise ValueError(f"Unknown bundle type: {bundle_type}")
+                        transactions.extend(process_bundle_product(user, product, quantity, session.id))
 
                 # Add all transactions
                 for transaction in transactions:
@@ -582,11 +890,41 @@ def webhook():
                 
                 db.commit()
 
+        elif event['type'] == 'invoice.paid':
+            invoice = event['data']['object']
+            subscription_id = invoice.get('subscription')
+            
+            if subscription_id:
+                subscription = stripe.Subscription.retrieve(subscription_id)
+                product = stripe.Product.retrieve(subscription.plan.product)
+                customer = stripe.Customer.retrieve(invoice.customer)
+                user = get_user_by_email(customer.email, db)
+                
+                test_case_credits = int(product.metadata.get('test_case', 0))
+                user_story_credits = int(product.metadata.get('user_story', 0))
+                is_renewal = invoice.get('billing_reason') == 'subscription_cycle'
+                
+                transactions = []
+                if is_renewal and user.stripe_subscription_id == subscription_id:
+                    transactions.extend(handle_subscription_renewal(
+                        user, subscription_id, test_case_credits, user_story_credits
+                    ))
+                elif not user.stripe_subscription_id or invoice.get('billing_reason') == 'subscription_create':
+                    transactions.extend(handle_new_subscription(
+                        user, subscription_id, test_case_credits, user_story_credits
+                    ))
+                
+                for transaction in transactions:
+                    db.add(transaction)
+                    
+                db.commit()
+                print(f"Successfully processed subscription update for user {user.email}")
+
         return jsonify({'status': 'success'}), 200
         
     except Exception as e:
         db.rollback()
-        print(f"Error processing event: {e}")
+        print(f"Error processing webhook: {str(e)}")
         return jsonify({'error': str(e)}), 500
     finally:
         db.close()
@@ -659,21 +997,36 @@ def test_emails():
 def get_transactions():
     db = SessionLocal()
     try:
-        # Get user_id from query params
         user_id = request.args.get('user_id')
         
         if not user_id:
             return jsonify({'error': 'user_id is required'}), 400
             
-        # Get optional filters
-        transaction_type = request.args.get('type')  # received, used, reset
-        source_type = request.args.get('source')     # subscription, top_up, trial
-        primary_type = request.args.get('primary')   # credit, scan
+        # Get user data first
+        user = db.query(User).get(user_id)
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+            
+        # Format user data
+        user_data = {
+            'email': user.email,
+            'current_test_case': user.current_test_case,
+            'current_user_story': user.current_user_story,
+            'validity_expiration': user.validity_expiration.isoformat() if user.validity_expiration else None,
+            'has_used_trial': user.has_used_trial,
+            'trial_end_date': user.trial_end_date.isoformat() if user.trial_end_date else None,
+            'is_subscription_active': bool(user.stripe_subscription_id),
+            'subscription_id': user.stripe_subscription_id
+        }
+            
+        # Get transaction filters
+        transaction_type = request.args.get('type')
+        source_type = request.args.get('source')
+        primary_type = request.args.get('primary')
         
-        # Start with base query
+        # Query transactions
         query = db.query(Transaction).filter(Transaction.user_id == user_id)
         
-        # Apply optional filters
         if transaction_type:
             query = query.filter(Transaction.transaction_type == transaction_type)
         if source_type:
@@ -681,10 +1034,8 @@ def get_transactions():
         if primary_type:
             query = query.filter(Transaction.primary_type == primary_type)
             
-        # Order by created_at descending (newest first)
         transactions = query.order_by(Transaction.created_at.desc()).all()
         
-        # Format response
         transaction_list = []
         for transaction in transactions:
             transaction_list.append({
@@ -699,23 +1050,23 @@ def get_transactions():
                 'created_at': transaction.created_at.isoformat()
             })
             
-        # Get summary statistics
         summary = {
             'total_credits_received': sum(t.value for t in transactions 
-                if t.primary_type == 'credit' and t.transaction_type == 'received'),
+                if t.primary_type == 'user_story' and t.transaction_type == 'received'),
             'total_credits_used': sum(t.value for t in transactions 
-                if t.primary_type == 'credit' and t.transaction_type == 'used'),
+                if t.primary_type == 'user_story' and t.transaction_type == 'used'),
             'total_credits_reset': sum(t.value for t in transactions 
-                if t.primary_type == 'credit' and t.transaction_type == 'reset'),
+                if t.primary_type == 'user_story' and t.transaction_type == 'reset'),
             'total_scans_received': sum(t.value for t in transactions 
-                if t.primary_type == 'scan' and t.transaction_type == 'received'),
+                if t.primary_type == 'test_case' and t.transaction_type == 'received'),
             'total_scans_used': sum(t.value for t in transactions 
-                if t.primary_type == 'scan' and t.transaction_type == 'used'),
+                if t.primary_type == 'test_case' and t.transaction_type == 'used'),
             'total_scans_reset': sum(t.value for t in transactions 
-                if t.primary_type == 'scan' and t.transaction_type == 'reset')
+                if t.primary_type == 'test_case' and t.transaction_type == 'reset')
         }
         
         return jsonify({
+            'user': user_data,
             'transactions': transaction_list,
             'summary': summary,
             'filters': {
@@ -731,7 +1082,6 @@ def get_transactions():
         return jsonify({'error': str(e)}), 500
     finally:
         db.close()
-
 def extract_user_data(event):
     invoice = event['data']['object']
     
