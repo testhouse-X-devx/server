@@ -18,7 +18,6 @@ from email_service import EmailService
 
 
 
-# trial plan creation + integration , bundles / plan creation & listing.  
 
 
 app = Flask(__name__)
@@ -42,11 +41,12 @@ class User(Base):
     __tablename__ = 'users'
     id = Column(Integer, primary_key=True)
     email = Column(String(255), unique=True)
-    role = Column(String(50), default='admin')  # Keep this enum as it's working
-    
+    role = Column(String(50), default='admin')
 
-    # if bundle plan 
+    # Validity and expiration management
     validity_expiration = Column(DateTime, nullable=True)
+    credit_cleanup_date = Column(DateTime, nullable=True)  # 30 days after validity expiration
+    account_deletion_date = Column(DateTime, nullable=True)  # 150 days after credit cleanup
 
     # Admin-specific columns
     stripe_customer_id = Column(String(255), unique=True, nullable=True)
@@ -56,14 +56,17 @@ class User(Base):
     
     is_blocked = Column(Boolean, default=False)
     benefits_end_date = Column(DateTime, nullable=True)
-    # Common columns for both admin and team members
+    
+    # Credits
     current_user_story = Column(Integer, default=0)
     current_test_case = Column(Integer, default=0)
     
     # Team member creation tracking
     created_by = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
-
+    
+    # Soft delete
+    is_deleted = Column(Boolean, default=False)
 
 class Transaction(Base):
     __tablename__ = 'transactions'
@@ -191,10 +194,24 @@ def get_products():
     try:
         selected_option = request.args.get('option', '')
         include_trials = request.args.get('include_trials', 'true').lower() == 'true'
-        products = stripe.Product.list(active=True)
+        
+        # Create search query for metadata
+        search_query = 'metadata["type"]:"bundle" OR metadata["type"]:"trial"'
+        
+        # Search products with metadata filter
+        products = stripe.Product.search(
+            query=search_query,
+            limit=100
+        )
+        
+        print(f"Number of products found: {len(products.data)}")
         product_data = []
 
         for product in products.data:
+            # Skip inactive products
+            if not product.active:
+                continue
+
             # Check if product is a trial product
             is_trial = product.metadata.get('type', '').lower() == 'trial'
             
@@ -209,7 +226,7 @@ def get_products():
                 
             base_price = prices.data[0]  # Using first price as base price
             
-            # Handle trial products differently
+            # Rest of your existing code stays exactly the same...
             if is_trial:
                 trial_entry = {
                     "id": product.id,
@@ -233,7 +250,7 @@ def get_products():
             base_units = base_price.transform_quantity.get('divide_by') if base_price.transform_quantity else 1
             base_unit_amount = base_price.unit_amount / base_units
 
-            # Get all price options from metadata
+            # Your existing code for credit options and pricing continues...
             credit_options = []
             for key in product.metadata:
                 if key.startswith('option-') and key.replace('option-', '').isdigit():
@@ -287,6 +304,7 @@ def get_products():
     except Exception as e:
         print(f"Error in get_products: {str(e)}")
         return jsonify({"error": str(e)}), 500
+    
 def format_currency(amount, currency):
     """Helper function to format currency amounts"""
     symbols = {'usd': '$', 'gbp': '£', 'eur': '€'}
@@ -425,7 +443,12 @@ def create_checkout_session():
         if not user:
             user = User(email=email)
             db.add(user)
-
+        elif user.stripe_subscription_id and not is_subscription:
+            # If user has active subscription and trying to buy bundle
+            return jsonify({
+                'error': 'You already have an active subscription. Please manage your subscription instead of buying bundles.'
+            }), 400
+        
         # Get or create Stripe customer
         if not user.stripe_customer_id:
             customer = stripe.Customer.create(
@@ -624,6 +647,18 @@ def create_portal_session():
 
 def reset_trial_credits(user, session_id, db):
     """Reset trial credits and create reset transactions."""
+    # First check if we have already reset these trial credits
+    reset_transactions = db.query(Transaction).filter(
+        Transaction.user_id == user.id,
+        Transaction.source_type == 'trial',
+        Transaction.transaction_type == 'reset'
+    ).all()
+
+    # If we have reset transactions, don't reset again
+    if reset_transactions:
+        return []
+
+    # Get trial credit transactions
     trial_transactions = db.query(Transaction).filter(
         Transaction.user_id == user.id,
         Transaction.source_type == 'trial',
@@ -664,7 +699,6 @@ def reset_trial_credits(user, session_id, db):
             user.current_user_story -= trial_user_stories
 
     return transactions
-
 def process_trial_product(user, product, session_id):
     """Process trial product purchase and return transactions."""
     trial_days = int(product.metadata.get('expiration_in_days', 0))
@@ -727,7 +761,7 @@ def process_bundle_product(user, product, quantity, session_id):
             source_type='bundle',
             transaction_type='received',
             value=quantity,
-            payment_id=session.id,
+            payment_id=session_id,
             description="User story bundle credits"
         )
         user.current_user_story += quantity
@@ -768,8 +802,8 @@ def handle_new_subscription(user, subscription_id, test_case_credits, user_story
     """Handle new subscription creation and return transactions."""
     transactions = []
     
-    # Reset trial credits if necessary
-    if user.has_used_trial:
+    # Reset trial credits only if they're from a trial (both conditions must be true)
+    if user.has_used_trial and user.trial_end_date:
         if user.current_test_case > 0:
             transactions.append(Transaction(
                 user_id=user.id,
@@ -816,9 +850,11 @@ def handle_new_subscription(user, subscription_id, test_case_credits, user_story
         )
     ])
     
-    # Update user properties
-    user.current_test_case = test_case_credits
-    user.current_user_story = user_story_credits
+    # Update user properties - add to existing credits
+    user.current_test_case += test_case_credits
+    user.current_user_story += user_story_credits
+    
+    # Update subscription related fields
     user.stripe_subscription_id = subscription_id
     user.has_used_trial = True
     user.trial_end_date = None
@@ -839,6 +875,7 @@ def webhook():
         print(f"Received webhook event: {event['type']}")
         
         if event['type'] == 'checkout.session.completed':
+            print(f"Checkout session completed: {event['data']['object']}")
             session = event['data']['object']
             
             if session.mode == 'payment':
@@ -849,6 +886,13 @@ def webhook():
 
                 customer = stripe.Customer.retrieve(session.customer)
                 user = get_user_by_email(customer.email, db)
+
+                # Handle unblocking if user was blocked but not deleted
+                if user.is_blocked and not user.is_deleted:
+                    user.is_blocked = False
+                    user.credit_cleanup_date = None
+                    user.account_deletion_date = None
+
                 transactions = []
 
                 # Validate product mix and get max validity
@@ -899,11 +943,18 @@ def webhook():
                 product = stripe.Product.retrieve(subscription.plan.product)
                 customer = stripe.Customer.retrieve(invoice.customer)
                 user = get_user_by_email(customer.email, db)
-                
+
+                # Handle unblocking if user was blocked but not deleted
+                if user.is_blocked and not user.is_deleted:
+                    user.is_blocked = False
+                    user.credit_cleanup_date = None
+                    user.account_deletion_date = None
+
                 test_case_credits = int(product.metadata.get('test_case', 0))
                 user_story_credits = int(product.metadata.get('user_story', 0))
                 is_renewal = invoice.get('billing_reason') == 'subscription_cycle'
-                
+                print(f"in renewal {user.email} (renewal: {is_renewal})")
+
                 transactions = []
                 if is_renewal and user.stripe_subscription_id == subscription_id:
                     transactions.extend(handle_subscription_renewal(
@@ -919,7 +970,24 @@ def webhook():
                     
                 db.commit()
                 print(f"Successfully processed subscription update for user {user.email}")
-
+        elif event['type'] == 'customer.subscription.deleted':
+            subscription = event['data']['object']
+            
+            # Get customer and user
+            customer_id = subscription['customer']
+            print(f"Customer ID: in subscription deleted {customer_id}")
+            customer = stripe.Customer.retrieve(customer_id)
+            user = get_user_by_email(customer.email, db)
+            
+            if not user:
+                raise Exception(f"User not found for customer {customer_id}")
+            
+            # Set blocked status and benefits end date (3 months from now)
+            user.stripe_subscription_id = None
+            
+            
+            print(f"Subscription cancelled for user {user.email}. Benefits will expire on {user.benefits_end_date}")
+            db.commit()    
         return jsonify({'status': 'success'}), 200
         
     except Exception as e:
@@ -928,6 +996,7 @@ def webhook():
         return jsonify({'error': str(e)}), 500
     finally:
         db.close()
+
 @app.route('/api/test/emails', methods=['POST'])
 def test_emails():
     try:
@@ -1103,6 +1172,99 @@ def extract_user_data(event):
             'state': invoice['customer_address']['state']
         }
     }
+
+
+@app.route('/api/process-expired-users', methods=['POST'])
+def process_expired_users():
+    db = SessionLocal()
+    try:
+        current_time = datetime.utcnow()
+        processed_users = {
+            'newly_blocked': 0,
+            'credits_removed': 0,
+            'soft_deleted': 0
+        }
+        
+        # validity_expiration -> 90 days
+        # is_blocked
+        # credit_cleanup_date -> 30days more
+        # is_deleted -> 150 days more
+
+        # 1. Find users with expired validity but not yet blocked (handling 90days)
+        expired_users = db.query(User).filter(
+            User.validity_expiration < current_time,
+            User.credit_cleanup_date.is_(None),
+            User.is_deleted.is_(False),
+            User.is_blocked.is_(False)
+        ).all()
+
+        for user in expired_users:
+            user.is_blocked = True
+            user.credit_cleanup_date = current_time + timedelta(days=30)
+            user.account_deletion_date = current_time + timedelta(days=180)  # 180 days
+            processed_users['newly_blocked'] += 1
+
+        # 2. Find users ready for credit removal (30 days after blocking)
+        credit_removal_users = db.query(User).filter(
+            User.credit_cleanup_date < current_time,
+            or_(
+                User.current_test_case > 0,
+                User.current_user_story > 0
+            ),
+            User.is_deleted.is_(False)
+        ).all()
+
+        for user in credit_removal_users:
+            # Remove test case credits
+            if user.current_test_case > 0:
+                db.add(Transaction(
+                    user_id=user.id,
+                    primary_type='test_case',
+                    source_type='system',
+                    transaction_type='reset',
+                    value=-user.current_test_case,
+                    description='Credits reset after 30 days of account blocking'
+                ))
+                user.current_test_case = 0
+
+            # Remove user story credits
+            if user.current_user_story > 0:
+                db.add(Transaction(
+                    user_id=user.id,
+                    primary_type='user_story',
+                    source_type='system',
+                    transaction_type='reset',
+                    value=-user.current_user_story,
+                    description='Credits reset after 30 days of account blocking'
+                ))
+                user.current_user_story = 0
+
+            processed_users['credits_removed'] += 1
+
+        # 3. Find users ready for deletion (180 days after initial blocking)
+        deletion_users = db.query(User).filter(
+            User.account_deletion_date < current_time,
+            User.is_deleted.is_(False)
+        ).all()
+
+        for user in deletion_users:
+            user.is_deleted = True
+            processed_users['soft_deleted'] += 1
+
+        db.commit()
+
+        return jsonify({
+            'status': 'success',
+            'processed': processed_users,
+            'timestamp': current_time.isoformat()
+        }), 200
+
+    except Exception as e:
+        db.rollback()
+        print(f"Error processing expired users: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        db.close()
 
 def check_trial_expiration():
     print(f"Running trial expiration check at {datetime.utcnow()}")
