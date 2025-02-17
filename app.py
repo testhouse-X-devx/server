@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import requests
 import os
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, Enum, Boolean
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, Enum, Boolean,or_
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.orm import Session
 from enum import Enum as PyEnum
@@ -449,6 +449,10 @@ def create_checkout_session():
                 'error': 'You already have an active subscription. Please manage your subscription instead of buying bundles.'
             }), 400
         
+        if has_trial and user.has_used_trial:
+            return jsonify({
+                'error': 'You have already used your trial period. Please select a regular plan.'
+            }), 400
         # Get or create Stripe customer
         if not user.stripe_customer_id:
             customer = stripe.Customer.create(
@@ -471,7 +475,9 @@ def create_checkout_session():
                         'type': 'subscription',
                         'test_case': str(bundle_quantities['test_case']),
                         'user_story': str(bundle_quantities['user_story']),
-                        'interval': '3_month'
+                        #TODO:
+                        # 'interval': '3_month'
+                        'interval': '1_DAY_TESTING'
                     }
                 )
                 
@@ -481,8 +487,11 @@ def create_checkout_session():
                     unit_amount=calculate_subscription_price(items),
                     currency=get_currency_for_country(country_code).lower(),
                     recurring={
-                        'interval': 'month',
-                        'interval_count': 3
+                        #TODO: 
+                        'interval': 'day',
+                        'interval_count': 1
+                        # 'interval': 'month',
+                        # 'interval_count': 3
                     }
                 )
             else:
@@ -702,8 +711,9 @@ def reset_trial_credits(user, session_id, db):
 def process_trial_product(user, product, session_id):
     """Process trial product purchase and return transactions."""
     trial_days = int(product.metadata.get('expiration_in_days', 0))
-    trial_end = datetime.utcnow() + timedelta(days=trial_days)
-    
+    #TODO: CHANGE THIS TRIAL END DATE AGAIN.
+    # trial_end = datetime.utcnow() + timedelta(days=trial_days)
+    trial_end = datetime.utcnow()
     user.has_used_trial = True
     user.trial_end_date = trial_end
 
@@ -795,7 +805,9 @@ def handle_subscription_renewal(user, subscription_id, test_case_credits, user_s
     
     user.current_test_case += test_case_credits
     user.current_user_story += user_story_credits
-    
+    #TODO:
+    # user.validity_expiration = datetime.utcnow() + timedelta(days=95)
+    user.validity_expiration = datetime.utcnow()
     return transactions
 
 def handle_new_subscription(user, subscription_id, test_case_credits, user_story_credits):
@@ -828,9 +840,9 @@ def handle_new_subscription(user, subscription_id, test_case_credits, user_story
             ))
             user.current_user_story = 0
     
-    # Add subscription transactions
-    transactions.extend([
-        Transaction(
+    # Add subscription transactions only for non-zero credits
+    if test_case_credits > 0:
+        transactions.append(Transaction(
             user_id=user.id,
             primary_type='test_case',
             source_type='subscription',
@@ -838,8 +850,10 @@ def handle_new_subscription(user, subscription_id, test_case_credits, user_story
             value=test_case_credits,
             subscription_id=subscription_id,
             description='Initial test case credits for subscription'
-        ),
-        Transaction(
+        ))
+    
+    if user_story_credits > 0:
+        transactions.append(Transaction(
             user_id=user.id,
             primary_type='user_story',
             source_type='subscription',
@@ -847,8 +861,7 @@ def handle_new_subscription(user, subscription_id, test_case_credits, user_story
             value=user_story_credits,
             subscription_id=subscription_id,
             description='Initial user story credits for subscription'
-        )
-    ])
+        ))
     
     # Update user properties - add to existing credits
     user.current_test_case += test_case_credits
@@ -858,7 +871,9 @@ def handle_new_subscription(user, subscription_id, test_case_credits, user_story
     user.stripe_subscription_id = subscription_id
     user.has_used_trial = True
     user.trial_end_date = None
-    user.validity_expiration = datetime.utcnow() + timedelta(days=90)
+    #TODO: 
+    # user.validity_expiration = datetime.utcnow() + timedelta(days=95)
+    user.validity_expiration = datetime.utcnow() 
     
     return transactions
 @app.route('/webhook', methods=['POST'])
@@ -914,7 +929,9 @@ def webhook():
 
                 # Handle regular product validity and trial reset
                 if has_regular:
-                    user.validity_expiration = datetime.utcnow() + timedelta(days=max_validity_days)
+                    #TODO:
+                    # user.validity_expiration = datetime.utcnow() + timedelta(days=max_validity_days)
+                    user.validity_expiration = datetime.utcnow() # FOR TESTING PURPOSE
                     transactions.extend(reset_trial_credits(user, session.id, db))
 
                 # Process each line item
@@ -1085,7 +1102,8 @@ def get_transactions():
             'has_used_trial': user.has_used_trial,
             'trial_end_date': user.trial_end_date.isoformat() if user.trial_end_date else None,
             'is_subscription_active': bool(user.stripe_subscription_id),
-            'subscription_id': user.stripe_subscription_id
+            'subscription_id': user.stripe_subscription_id,
+            'is_blocked': user.is_blocked if user.is_blocked else False
         }
             
         # Get transaction filters
@@ -1200,8 +1218,11 @@ def process_expired_users():
 
         for user in expired_users:
             user.is_blocked = True
-            user.credit_cleanup_date = current_time + timedelta(days=30)
-            user.account_deletion_date = current_time + timedelta(days=180)  # 180 days
+            #TODO:
+            # user.credit_cleanup_date = current_time + timedelta(days=30)
+            user.credit_cleanup_date = current_time + timedelta(minutes=1)
+            # user.account_deletion_date = current_time + timedelta(days=180)  # 180 days
+            user.account_deletion_date = current_time + timedelta(minutes=7)  
             processed_users['newly_blocked'] += 1
 
         # 2. Find users ready for credit removal (30 days after blocking)
@@ -1266,6 +1287,8 @@ def process_expired_users():
     finally:
         db.close()
 
+
+@app.route('/api/process-trial-expiration', methods=['POST'])
 def check_trial_expiration():
     print(f"Running trial expiration check at {datetime.utcnow()}")
     db = SessionLocal()
@@ -1276,43 +1299,49 @@ def check_trial_expiration():
             User.trial_end_date < datetime.utcnow()
         ).all()
         
+        print(f"Found {len(expired_trials)} expired trials")
+
         for user in expired_trials:
             print(f"Processing expired trial for user {user.email}")
             
             # Create reset transactions
-            if user.current_credits > 0:
+            if user.current_test_case > 0:
                 credit_reset_transaction = Transaction(
                     user_id=user.id,
-                    primary_type='credit',
+                    primary_type='test_case',
                     source_type='trial',
                     transaction_type='reset',
-                    value=user.current_credits,
-                    description='Reset credits due to trial expiration'
+                    value=user.current_test_case,
+                    description='Reset test case credits due to trial expiration'
                 )
                 db.add(credit_reset_transaction)
             
-            if user.current_scans > 0:
+            if user.current_user_story > 0:
                 scan_reset_transaction = Transaction(
                     user_id=user.id,
-                    primary_type='scan',
+                    primary_type='user_story',
                     source_type='trial',
                     transaction_type='reset',
-                    value=user.current_scans,
-                    description='Reset scans due to trial expiration'
+                    value=user.current_user_story,
+                    description='Reset user story credits due to trial expiration'
                 )
                 db.add(scan_reset_transaction)
             
             # Reset user limits
-            user.current_credits = 0
-            user.current_scans = 0
-            user.max_users = 0
+            user.current_user_story = 0
+            user.current_test_case = 0
             user.trial_end_date = None  # Clear trial end date
             
             print(f"Trial expired and limits reset for user {user.email}")
         
         db.commit()
         print(f"Processed {len(expired_trials)} expired trials")
-        
+
+        return jsonify({
+            'status': 'success',
+            
+        }), 200
+    
     except Exception as e:
         db.rollback()
         print(f"Error in trial expiration check: {str(e)}")
