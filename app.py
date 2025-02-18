@@ -194,6 +194,8 @@ def get_products():
     try:
         selected_option = request.args.get('option', '')
         include_trials = request.args.get('include_trials', 'true').lower() == 'true'
+        country_code = request.args.get('countryCode', 'GB')
+        currency = 'gbp' if country_code == 'GB' else 'usd'
         
         # Create search query for metadata
         search_query = 'metadata["type"]:"bundle" OR metadata["type"]:"trial"'
@@ -220,13 +222,12 @@ def get_products():
                 continue
 
             # Get base price first
-            prices = stripe.Price.list(product=product.id)
+            prices = stripe.Price.list(product=product.id, active=True, expand=['data.currency_options'])
             if not prices.data:
                 continue
                 
             base_price = prices.data[0]  # Using first price as base price
-            
-            # Rest of your existing code stays exactly the same...
+
             if is_trial:
                 trial_entry = {
                     "id": product.id,
@@ -248,9 +249,12 @@ def get_products():
 
             # Get base units from transform_quantity.divide_by
             base_units = base_price.transform_quantity.get('divide_by') if base_price.transform_quantity else 1
-            base_unit_amount = base_price.unit_amount / base_units
+            
+            # Get unit amount based on currency
+            unit_amount = base_price.currency_options[currency]['unit_amount'] if currency in base_price.currency_options else base_price.unit_amount
+            base_unit_amount = unit_amount / base_units
 
-            # Your existing code for credit options and pricing continues...
+            # Get credit options from metadata
             credit_options = []
             for key in product.metadata:
                 if key.startswith('option-') and key.replace('option-', '').isdigit():
@@ -303,8 +307,7 @@ def get_products():
 
     except Exception as e:
         print(f"Error in get_products: {str(e)}")
-        return jsonify({"error": str(e)}), 500
-    
+        return jsonify({"error": str(e)}), 500    
 def format_currency(amount, currency):
     """Helper function to format currency amounts"""
     symbols = {'usd': '$', 'gbp': '£', 'eur': '€'}
@@ -419,7 +422,7 @@ def create_checkout_session():
         email = data.get('email')
         items = data.get('items', [])  # Array of {priceId, credits}
         is_subscription = data.get('isSubscription', False)
-        country_code = 'GB'
+        country_code = data.get('countryCode', 'US')
 
         if not email:
             return jsonify({'error': 'Email is required'}), 400
@@ -526,7 +529,7 @@ def create_checkout_session():
             for item in items:
                 price_id = item.get('priceId')
                 credits = item.get('credits')
-                
+                print(f"Adding credits: {price_id}")
                 if price_id and credits:
                     if isinstance(credits, dict):  # Trial plan
                         metadata['test_case_credits'] = credits.get('test_case', 0)
