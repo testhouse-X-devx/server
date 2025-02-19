@@ -18,14 +18,23 @@ from email_service import EmailService
 
 
 
-
+# Email Scenarios.
+# When a customer buys a credit plan, an receipt has to be sent to the customer email. ( on stripe on the mails for successful payments )
+# If auto-debit is enabled then a mail should be sent informing the same.  ( in handle new subscription function  )
+# At each transaction of auto debit mail should be send before one day as well as after the auto debit along with the invoice. (stripe )
+# Whenever auto debit is disabled. ( in subscription deleted )
+# A week before the validity ends and one day before the validity to inform that the plan is expiring.[if auto debit not enabled] (in our expiring handling match the 83th day and 89th day )
+# Next day after expiry if not purchased any plan to inform that the credits will be retained only for next 30 days and also that they can unsubscribe at any time so their data will be deleted. (91th day expiry handling)
+# After 30 days to inform that the credits are reset to zero and also that after 180 days from validity data will be deleted unless unsubscribed. (120th day /30th day )
+# 1 week before 180 days and 2 days before 180 days informing them of the upcoming deletion if they have not bought a plan (expiry 173rd day , 178th day)
+# After 180 days informing that the data is deleted. ( 180th day)
 
 app = Flask(__name__)
 app.config.from_object(Config)
 
 CORS(app, resources={
     r"/*": {
-        "origins": ["http://localhost:5173", "http://127.0.0.1:5173"],
+        "origins": ["http://localhost:5175", "http://127.0.0.1:5175"],
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"]
     }
@@ -516,8 +525,8 @@ def create_checkout_session():
                 }],
                 mode='subscription',
                 currency=get_currency_for_country(country_code).lower(),
-                success_url=f"{request.headers.get('Origin', 'http://localhost:5173')}/success?session_id={{CHECKOUT_SESSION_ID}}",
-                cancel_url=f"{request.headers.get('Origin', 'http://localhost:5173')}/cancel",
+                success_url=f"{request.headers.get('Origin', 'http://localhost:5175')}/success?session_id={{CHECKOUT_SESSION_ID}}",
+                cancel_url=f"{request.headers.get('Origin', 'http://localhost:5175')}/cancel",
                 allow_promotion_codes=True,
                 
             )
@@ -550,8 +559,8 @@ def create_checkout_session():
                 line_items=line_items,
                 mode='payment',
                 currency=get_currency_for_country(country_code).lower(),
-                success_url=f"{request.headers.get('Origin', 'http://localhost:5173')}/success?session_id={{CHECKOUT_SESSION_ID}}",
-                cancel_url=f"{request.headers.get('Origin', 'http://localhost:5173')}/cancel",
+                success_url=f"{request.headers.get('Origin', 'http://localhost:5175')}/success?session_id={{CHECKOUT_SESSION_ID}}",
+                cancel_url=f"{request.headers.get('Origin', 'http://localhost:5175')}/cancel",
                 allow_promotion_codes=True,
                 metadata=metadata,
                 
@@ -643,7 +652,7 @@ def create_portal_session():
         # Create billing portal session
         session = stripe.billing_portal.Session.create(
             customer=user.stripe_customer_id,
-            return_url=f"{request.headers.get('Origin', 'http://localhost:5173')}/subscriptions"
+            return_url=f"{request.headers.get('Origin', 'http://localhost:5175')}/subscriptions"
         )
 
         return jsonify({
@@ -984,7 +993,8 @@ def webhook():
                     transactions.extend(handle_new_subscription(
                         user, subscription_id, test_case_credits, user_story_credits
                     ))
-                
+                    #TODO: ADD MAIL FUNCTION HERE FOR : If auto-debit is enabled then a mail should be sent informing the same. 
+
                 for transaction in transactions:
                     db.add(transaction)
                     
@@ -1005,7 +1015,8 @@ def webhook():
             # Set blocked status and benefits end date (3 months from now)
             user.stripe_subscription_id = None
             
-            
+            #TODO:  ADD MAIL FUNCTION HERE FOR : Whenever auto debit is disabled. 
+
             print(f"Subscription cancelled for user {user.email}. Benefits will expire on {user.benefits_end_date}")
             db.commit()    
         return jsonify({'status': 'success'}), 200
@@ -1262,7 +1273,7 @@ def process_expired_users():
                     description='Credits reset after 30 days of account blocking'
                 ))
                 user.current_user_story = 0
-
+            #TODO: SEND EMAIL TO THE USER.
             processed_users['credits_removed'] += 1
 
         # 3. Find users ready for deletion (180 days after initial blocking)
@@ -1274,6 +1285,72 @@ def process_expired_users():
         for user in deletion_users:
             user.is_deleted = True
             processed_users['soft_deleted'] += 1
+
+        # 4. Seven day warning notifications 83rd
+        seven_day_warning_users = db.query(User).filter(
+            User.validity_expiration - timedelta(days=7) <= current_time,
+            User.validity_expiration - timedelta(days=6) > current_time,
+            User.subscription_id.is_(None),
+            User.is_blocked.is_(False)
+        ).all()
+
+        for user in seven_day_warning_users:
+            # TODO: Implement email notification for 7-day warning
+            # send_expiration_warning_email(user, days_remaining=7)
+            processed_users['notifications_queued'] += 1
+
+        # 5. Find users who need 1-day warning (89th day)
+        # Their validity_expiration (90th day) is 1 day away
+        one_day_warning_users = db.query(User).filter(
+            User.validity_expiration - timedelta(days=1) <= current_time,
+            User.validity_expiration > current_time,
+            User.subscription_id.is_(None),
+            User.is_blocked.is_(False)
+        ).all()
+
+        for user in one_day_warning_users:
+            # TODO: Implement email notification for 1-day warning
+            # send_expiration_warning_email(user, days_remaining=1)
+            processed_users['notifications_queued'] += 1
+
+        # 6. Find users who need expiration notification (91st day)
+        # Their validity_expiration (90th day) was 1 day ago
+        expired_notification_users = db.query(User).filter(
+            User.validity_expiration + timedelta(days=1) > current_time,
+            User.validity_expiration <= current_time,
+            User.subscription_id.is_(None),
+            User.is_blocked.is_(False)
+        ).all()
+
+        for user in expired_notification_users:
+            # TODO: Implement email notification for expiration notice
+            # send_expiration_notice_email(user)
+            processed_users['notifications_queued'] += 1
+
+        # 7. Account deletion warnings
+        # Find users who need 7-day deletion warning
+        deletion_seven_day_warning = db.query(User).filter(
+            User.account_deletion_date - timedelta(days=7) <= current_time,
+            User.account_deletion_date - timedelta(days=6) > current_time,
+            User.is_deleted.is_(False)
+        ).all()
+
+        for user in deletion_seven_day_warning:
+            # TODO: Implement email notification for deletion 7-day warning
+            # send_deletion_warning_email(user, days_remaining=7)
+            processed_users['notifications_queued'] += 1
+
+        #8. Find users who need 1-day deletion warning
+        deletion_one_day_warning = db.query(User).filter(
+            User.account_deletion_date - timedelta(days=1) <= current_time,
+            User.account_deletion_date > current_time,
+            User.is_deleted.is_(False)
+        ).all()
+
+        for user in deletion_one_day_warning:
+            # TODO: Implement email notification for deletion 1-day warning
+            # send_deletion_warning_email(user, days_remaining=1)
+            processed_users['notifications_queued'] += 1
 
         db.commit()
 
