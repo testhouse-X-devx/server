@@ -89,6 +89,52 @@ class Transaction(Base):
     payment_id = Column(String(255))
     description = Column(String(255))
     created_at = Column(DateTime, default=datetime.utcnow)
+
+class ArchivedUser(Base):
+    __tablename__ = 'archived_users'
+    id = Column(Integer, primary_key=True)
+    original_id = Column(Integer)  # Store the original user ID
+    email = Column(String(255))
+    role = Column(String(50))
+    
+    # Validity and expiration management
+    validity_expiration = Column(DateTime, nullable=True)
+    credit_cleanup_date = Column(DateTime, nullable=True)
+    account_deletion_date = Column(DateTime, nullable=True)
+    
+    # Admin-specific columns
+    has_used_trial = Column(Boolean)
+    trial_end_date = Column(DateTime, nullable=True)
+    
+    is_blocked = Column(Boolean)
+    benefits_end_date = Column(DateTime, nullable=True)
+    
+    # Credits
+    current_user_story = Column(Integer)
+    current_test_case = Column(Integer)
+    
+    # Team member creation tracking
+    created_by = Column(Integer, nullable=True)
+    created_at = Column(DateTime)
+    
+    # Archive metadata
+    archived_at = Column(DateTime, default=datetime.utcnow)
+    
+class ArchivedTransaction(Base):
+    __tablename__ = 'archived_transactions'
+    id = Column(Integer, primary_key=True)
+    original_id = Column(Integer)  # Store the original transaction ID
+    user_id = Column(Integer)  # Reference to original user ID
+    primary_type = Column(String(50), nullable=False)
+    source_type = Column(String(50), nullable=False)
+    transaction_type = Column(String(50), nullable=False)
+    value = Column(Integer)
+    subscription_id = Column(String(255))
+    payment_id = Column(String(255))
+    description = Column(String(255))
+    created_at = Column(DateTime)
+    archived_at = Column(DateTime, default=datetime.utcnow)
+
 # Create tables
 def init_db():
     try:
@@ -755,7 +801,7 @@ def process_trial_product(user, product, session_id):
     
     user.current_test_case += test_case
     user.current_user_story += user_story
-    
+    #TODO: ADD EMAIL TRIGGER AT THE TIME OF BUYING TRIAL PLAN.
     return transactions
 
 def process_bundle_product(user, product, quantity, session_id):
@@ -1206,6 +1252,68 @@ def extract_user_data(event):
     }
 
 
+def archive_and_delete_user(db: Session, user: User):
+    """
+    Archives user data and their transactions, then deletes them from the main tables.
+    Also handles Stripe customer deletion if applicable.
+    """
+    try:
+        # 1. Delete from Stripe first if customer exists
+        if user.stripe_customer_id:
+            try:
+                stripe.Customer.delete(user.stripe_customer_id)
+            except stripe.error.StripeError as e:
+                print(f"Stripe deletion failed for user {user.email}: {str(e)}")
+                # Continue with archival process even if Stripe deletion fails
+        
+        # 2. Archive and delete transactions
+        transactions = db.query(Transaction).filter(Transaction.user_id == user.id).all()
+        
+        for transaction in transactions:
+            archived_transaction = ArchivedTransaction(
+                original_id=transaction.id,
+                user_id=transaction.user_id,
+                primary_type=transaction.primary_type,
+                source_type=transaction.source_type,
+                transaction_type=transaction.transaction_type,
+                value=transaction.value,
+                subscription_id=transaction.subscription_id,
+                payment_id=transaction.payment_id,
+                description=transaction.description,
+                created_at=transaction.created_at
+            )
+            db.add(archived_transaction)
+        
+        # Delete original transactions
+        db.query(Transaction).filter(Transaction.user_id == user.id).delete()
+        
+        # 3. Archive user (without Stripe information)
+        archived_user = ArchivedUser(
+            original_id=user.id,
+            email=user.email,
+            role=user.role,
+            validity_expiration=user.validity_expiration,
+            credit_cleanup_date=user.credit_cleanup_date,
+            account_deletion_date=user.account_deletion_date,
+            has_used_trial=user.has_used_trial,
+            trial_end_date=user.trial_end_date,
+            is_blocked=user.is_blocked,
+            benefits_end_date=user.benefits_end_date,
+            current_user_story=user.current_user_story,
+            current_test_case=user.current_test_case,
+            created_by=user.created_by,
+            created_at=user.created_at
+        )
+        db.add(archived_user)
+        
+        # 4. Delete original user
+        db.delete(user)
+        
+        return True
+    except Exception as e:
+        print(f"Error in archive_and_delete_user: {str(e)}")
+        raise e
+
 @app.route('/api/process-expired-users', methods=['POST'])
 def process_expired_users():
     db = SessionLocal()
@@ -1283,8 +1391,13 @@ def process_expired_users():
         ).all()
 
         for user in deletion_users:
-            user.is_deleted = True
-            processed_users['soft_deleted'] += 1
+            try:
+                
+                archive_and_delete_user(db, user)
+                processed_users['hard_deleted'] += 1
+            except Exception as e:
+                print(f"Failed to archive and delete user {user.email}: {str(e)}")
+
 
         # 4. Seven day warning notifications 83rd
         seven_day_warning_users = db.query(User).filter(
@@ -1411,7 +1524,7 @@ def check_trial_expiration():
             user.current_user_story = 0
             user.current_test_case = 0
             user.trial_end_date = None  # Clear trial end date
-            
+            #TODO: ADD EMAIL TRIGGER FOR TRIAL EXPIRATION.
             print(f"Trial expired and limits reset for user {user.email}")
         
         db.commit()
