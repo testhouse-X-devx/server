@@ -34,7 +34,7 @@ app.config.from_object(Config)
 
 CORS(app, resources={
     r"/*": {
-        "origins": ["http://localhost:5175", "http://127.0.0.1:5175"],
+        "origins": ["http://localhost:5173", "http://127.0.0.1:5173"],
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"]
     }
@@ -148,7 +148,10 @@ init_db()
 # Stripe API Key
 stripe.api_key = os.getenv('STRIPE_SECRET_KEY', 'sk_test_51QfxxdEf1mVEQwuO8oaLn5HrxduggqJc6iWANlc8G6CaFmcNzkvJ7wKXQLhRQRotSVGdRXUhaRkvWU0OMEhYHxho002cRkFu4R')
 EXCHANGE_RATE_API_KEY = os.getenv('EXCHANGE_RATE_API_KEY', '9493897f152ce55047ac6a08')
+# Add this at the beginning of your file with other imports
+stripe.api_version = "2024-12-18.acacia;custom_checkout_beta=v1"
 
+# Rest of your create_checkout_session code remains the same
 class PricingService:
     def __init__(self):
         self.api_key = '9493897f152ce55047ac6a08'
@@ -571,10 +574,9 @@ def create_checkout_session():
                 }],
                 mode='subscription',
                 currency=get_currency_for_country(country_code).lower(),
-                success_url=f"{request.headers.get('Origin', 'http://localhost:5175')}/success?session_id={{CHECKOUT_SESSION_ID}}",
-                cancel_url=f"{request.headers.get('Origin', 'http://localhost:5175')}/cancel",
                 allow_promotion_codes=True,
-                
+                ui_mode="custom",
+                return_url=f"{request.headers.get('Origin', 'http://localhost:5173')}/success"
             )
         else:
             # Regular one-time payment checkout
@@ -605,16 +607,14 @@ def create_checkout_session():
                 line_items=line_items,
                 mode='payment',
                 currency=get_currency_for_country(country_code).lower(),
-                success_url=f"{request.headers.get('Origin', 'http://localhost:5175')}/success?session_id={{CHECKOUT_SESSION_ID}}",
-                cancel_url=f"{request.headers.get('Origin', 'http://localhost:5175')}/cancel",
                 allow_promotion_codes=True,
                 metadata=metadata,
-                
+                ui_mode="custom",
+                return_url=f"{request.headers.get('Origin', 'http://localhost:5173')}/success"
             )
 
         return jsonify({
-            'sessionId': checkout_session.id,
-            'url': checkout_session.url
+            'clientSecret': checkout_session['client_secret']
         }), 200
 
     except Exception as e:
@@ -698,7 +698,7 @@ def create_portal_session():
         # Create billing portal session
         session = stripe.billing_portal.Session.create(
             customer=user.stripe_customer_id,
-            return_url=f"{request.headers.get('Origin', 'http://localhost:5175')}/subscriptions"
+            return_url=f"{request.headers.get('Origin', 'http://localhost:5173')}/subscriptions"
         )
 
         return jsonify({
