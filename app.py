@@ -34,7 +34,7 @@ app.config.from_object(Config)
 
 CORS(app, resources={
     r"/*": {
-        "origins": ["http://localhost:5175", "http://127.0.0.1:5175"],
+        "origins": ["http://localhost:5174", "http://127.0.0.1:5174"],
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"]
     }
@@ -421,7 +421,7 @@ def validate_product_combination(items):
     except stripe.error.StripeError as e:
         return (False, f'Error validating plans: {str(e)}', False, False, bundle_quantities)
 
-def find_matching_subscription_product(bundle_quantities):
+def find_matching_subscription_product(bundle_quantities,country_code):
     """Find existing subscription product with matching metadata."""
     products = stripe.Product.list(
         active=True,
@@ -432,6 +432,7 @@ def find_matching_subscription_product(bundle_quantities):
         if (product.metadata.get('type') == 'subscription' and
             product.metadata.get('test_case') == str(bundle_quantities['test_case']) and
             product.metadata.get('user_story') == str(bundle_quantities['user_story']) and
+            product.metadata.get('currency') == get_currency_for_country(country_code) and
             product.metadata.get('interval') == '3_month'):
             return product
             
@@ -522,7 +523,7 @@ def create_checkout_session():
 
         if is_subscription:
             # First, check if a matching subscription product exists
-            existing_product = find_matching_subscription_product(bundle_quantities)
+            existing_product = find_matching_subscription_product(bundle_quantities, country_code)
             
             if not existing_product:
                 # Create new subscription product with metadata
@@ -533,6 +534,7 @@ def create_checkout_session():
                         'type': 'subscription',
                         'test_case': str(bundle_quantities['test_case']),
                         'user_story': str(bundle_quantities['user_story']),
+                        'currency': get_currency_for_country(country_code).lower(),
                         #TODO:
                         # 'interval': '3_month'
                         'interval': '1_DAY_TESTING'
@@ -571,8 +573,8 @@ def create_checkout_session():
                 }],
                 mode='subscription',
                 currency=get_currency_for_country(country_code).lower(),
-                success_url=f"{request.headers.get('Origin', 'http://localhost:5175')}/success?session_id={{CHECKOUT_SESSION_ID}}",
-                cancel_url=f"{request.headers.get('Origin', 'http://localhost:5175')}/cancel",
+                success_url=f"{request.headers.get('Origin', 'http://localhost:5174')}/success?session_id={{CHECKOUT_SESSION_ID}}",
+                cancel_url=f"{request.headers.get('Origin', 'http://localhost:5174')}/cancel",
                 allow_promotion_codes=True,
                 
             )
@@ -605,8 +607,8 @@ def create_checkout_session():
                 line_items=line_items,
                 mode='payment',
                 currency=get_currency_for_country(country_code).lower(),
-                success_url=f"{request.headers.get('Origin', 'http://localhost:5175')}/success?session_id={{CHECKOUT_SESSION_ID}}",
-                cancel_url=f"{request.headers.get('Origin', 'http://localhost:5175')}/cancel",
+                success_url=f"{request.headers.get('Origin', 'http://localhost:5174')}/success?session_id={{CHECKOUT_SESSION_ID}}",
+                cancel_url=f"{request.headers.get('Origin', 'http://localhost:5174')}/cancel",
                 allow_promotion_codes=True,
                 metadata=metadata,
                 
@@ -698,7 +700,7 @@ def create_portal_session():
         # Create billing portal session
         session = stripe.billing_portal.Session.create(
             customer=user.stripe_customer_id,
-            return_url=f"{request.headers.get('Origin', 'http://localhost:5175')}/subscriptions"
+            return_url=f"{request.headers.get('Origin', 'http://localhost:5174')}/subscriptions"
         )
 
         return jsonify({
