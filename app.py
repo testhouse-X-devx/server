@@ -28,6 +28,7 @@ from email_service import EmailService
 # After 30 days to inform that the credits are reset to zero and also that after 180 days from validity data will be deleted unless unsubscribed. (120th day /30th day )
 # 1 week before 180 days and 2 days before 180 days informing them of the upcoming deletion if they have not bought a plan (expiry 173rd day , 178th day)
 # After 180 days informing that the data is deleted. ( 180th day)
+# When someone intiiates purchase order
 
 app = Flask(__name__)
 app.config.from_object(Config)
@@ -635,6 +636,7 @@ def create_purchase_order():
         email = data.get('email')
         items = data.get('items', [])  # Array of {priceId, credits}
         is_subscription = data.get('isSubscription', False)
+        print(f"country code in purchase order: {data.get('countryCode')}")
         country_code = data.get('countryCode', 'GB')
         company_name = data.get('companyName', '')
         po_number = data.get('poNumber', '')
@@ -707,29 +709,30 @@ def create_purchase_order():
                         'interval': '3_month'
                     }
                 )
-                
-                # Calculate the total price
-                subscription_amount = calculate_subscription_price(items)
-                
-                # Create a one-time price for the invoice
-                one_time_price = stripe.Price.create(
-                    product=product.id,
-                    unit_amount=subscription_amount,
-                    currency=get_currency_for_country(country_code).lower()
-                    # No recurring parameter makes this a one-time price
-                )
             else:
                 product = existing_product
-                # Calculate the total price
-                subscription_amount = calculate_subscription_price(items)
-                
-                # Create a one-time price for the invoice
-                one_time_price = stripe.Price.create(
-                    product=product.id,
-                    unit_amount=subscription_amount,
-                    currency=get_currency_for_country(country_code).lower()
-                    # No recurring parameter makes this a one-time price
-                )
+            
+            # Calculate the total price
+            subscription_amount = calculate_subscription_price(items)
+            
+            # Create a one-time price for the invoice
+            one_time_price = stripe.Price.create(
+                product=product.id,
+                unit_amount=subscription_amount,
+                currency=get_currency_for_country(country_code).lower()
+                # No recurring parameter makes this a one-time price
+            )
+            
+            # Also create a recurring price (to be used later in the webhook)
+            recurring_price = stripe.Price.create(
+                product=product.id,
+                unit_amount=subscription_amount,
+                currency=get_currency_for_country(country_code).lower(),
+                recurring={
+                    'interval': 'month',
+                    'interval_count': 3
+                }
+            )
             
             # Create a description for the invoice
             for item in items:
@@ -757,7 +760,8 @@ def create_purchase_order():
                     "subscription_type": "3_month",
                     "product_id": product.id,
                     "test_case": str(bundle_quantities['test_case']),
-                    "user_story": str(bundle_quantities['user_story'])
+                    "user_story": str(bundle_quantities['user_story']),
+                    "recurring_price_id": recurring_price.id  # Store recurring price ID for webhook
                 }
             )
             
@@ -769,6 +773,8 @@ def create_purchase_order():
                 quantity=1,
                 description=f"3-Month Subscription: {', '.join(product_descriptions)}"
             )
+
+            # TODO : STEFFY ADD THE MAIL TRIGGER HERE WHERE YOU SHARE THE INVOICE LINK.
             
         else:
             # Create a draft invoice for one-time purchase with send_invoice
@@ -844,7 +850,7 @@ def create_purchase_order():
         print(f"Error in create_purchase_order: {str(e)}")
         return jsonify({'error': str(e)}), 500
     finally:
-        db.close()    
+        db.close()
 @app.route('/api/subscription', methods=['GET'])
 def get_customer_subscription():
     db = SessionLocal()
@@ -1059,6 +1065,134 @@ def process_bundle_product(user, product, quantity, session_id):
         
     return [transaction]
 
+#TODO: ADDED THIS FUNCTION.
+def process_purchase_order_invoice(invoice, user, db):
+    """
+    Process a paid purchase order invoice.
+    This handles both subscription and regular bundle purchase orders.
+    
+    Args:
+        invoice: The Stripe invoice object
+        user: The user object from the database
+        db: Database session
+    
+    Returns:
+        List of transactions created
+    """
+    print(f"Processing purchase order invoice payment for user {user.email}")
+    
+    # Get invoice items
+    invoice_items = stripe.InvoiceItem.list(invoice=invoice.id)
+    
+    # Process each invoice item
+    transactions = []
+    
+    # Check if this is a subscription PO
+    if invoice.metadata.get('is_subscription') == 'true':
+        # Look for recurring_price_id in metadata
+        recurring_price_id = invoice.metadata.get('recurring_price_id')
+        
+        if recurring_price_id:
+            print(f"Creating subscription from PO with recurring price: {recurring_price_id}")
+            
+            # Get recurring price details
+            recurring_price = stripe.Price.retrieve(recurring_price_id, expand=['product'])
+            product = recurring_price.product
+            
+            # Create subscription with the recurring price
+            subscription = stripe.Subscription.create(
+                customer=user.stripe_customer_id,
+                items=[
+                    {'price': recurring_price_id},
+                ],
+                metadata={
+                    'created_from_po': 'true',
+                    'po_number': invoice.metadata.get('po_number'),
+                    'invoice_id': invoice.id
+                }
+            )
+            
+            # Save subscription ID to user
+            user.stripe_subscription_id = subscription.id
+            
+            # Get credit amounts from product metadata
+            test_case_credits = int(product.metadata.get('test_case', 0))
+            user_story_credits = int(product.metadata.get('user_story', 0))
+            
+            # Process like a new subscription
+            transactions.extend(handle_new_subscription(
+                user, subscription.id, test_case_credits, user_story_credits
+            ))
+            
+            # Update validity expiration for subscription
+            # For subscriptions, set validity to match the subscription period
+            # Extract interval details from subscription or product metadata
+            interval = product.metadata.get('interval', '3_month')
+            
+            # Parse the interval to determine the validity period
+        
+            validity_days = 95
+            
+            # Set the validity expiration date
+            user.validity_expiration = datetime.utcnow() + timedelta(days=validity_days)
+            print(f"Set subscription validity expiration to {user.validity_expiration} for user {user.email}")
+    else:
+        # Process as regular bundle purchase
+        for item in invoice_items.data:
+            # Get the price and product details
+            if item.price:
+                price = stripe.Price.retrieve(item.price.id, expand=['product'])
+                product = price.product
+                
+                # Determine bundle type from product metadata
+                bundle_type = product.metadata.get('bundle_type', '').lower()
+                quantity = item.quantity
+                
+                if bundle_type == 'test_case':
+                    transactions.append(
+                        Transaction(
+                            user_id=user.id,
+                            primary_type='test_case',
+                            source_type='bundle',
+                            transaction_type='received',
+                            value=quantity,
+                            payment_id=invoice.id,
+                            description=f"Purchase order test case credits: {invoice.metadata.get('po_number', 'N/A')}"
+                        )
+                    )
+                    user.current_test_case += quantity
+                elif bundle_type == 'user_story':
+                    transactions.append(
+                        Transaction(
+                            user_id=user.id,
+                            primary_type='user_story',
+                            source_type='bundle',
+                            transaction_type='received',
+                            value=quantity,
+                            payment_id=invoice.id,
+                            description=f"Purchase order user story credits: {invoice.metadata.get('po_number', 'N/A')}"
+                        )
+                    )
+                    user.current_user_story += quantity
+    
+        # Set validity expiration for non-subscription purchases
+        if transactions:
+            # Get validity period from metadata or default to 90 days
+            validity_days = 90
+            for item in invoice_items.data:
+                if item.price and item.price.product:
+                    product = stripe.Product.retrieve(item.price.product)
+                    product_validity = int(product.metadata.get('validity_in_days', 0))
+                    if product_validity > validity_days:
+                        validity_days = product_validity
+            
+            # Only update validity if it extends the current validity
+            new_validity = datetime.utcnow() + timedelta(days=validity_days)
+            if not user.validity_expiration or new_validity > user.validity_expiration:
+                user.validity_expiration = new_validity
+                print(f"Set bundle validity expiration to {user.validity_expiration} for user {user.email}")
+    
+    return transactions
 def handle_subscription_renewal(user, subscription_id, test_case_credits, user_story_credits):
     """Handle subscription renewal and return transactions."""
     transactions = [
@@ -1242,7 +1376,7 @@ def webhook():
             if not user:
                 print(f"User not found for customer {customer_id}")
                 return jsonify({'error': 'User not found'}), 404
-                
+                    
             # Handle unblocking if user was blocked but not deleted
             if user.is_blocked and not user.is_deleted:
                 user.is_blocked = False
@@ -1251,90 +1385,8 @@ def webhook():
             
             # Check if this is a purchase order invoice
             if not subscription_id and invoice.get('metadata', {}).get('po_number'):
-                print(f"Processing purchase order invoice payment for user {user.email}")
-                
-                # Get invoice items
-                invoice_items = stripe.InvoiceItem.list(invoice=invoice.id)
-                
-                # Process each invoice item
-                transactions = []
-                for item in invoice_items.data:
-                    # Get the price and product details
-                    if item.price:
-                        price = stripe.Price.retrieve(item.price.id, expand=['product'])
-                        product = price.product
-                        
-                        # Determine bundle type from product metadata
-                        bundle_type = product.metadata.get('bundle_type', '').lower()
-                        quantity = item.quantity
-                        
-                        # Handle subscription case
-                        if invoice.metadata.get('is_subscription') == 'true':
-                            test_case_credits = int(product.metadata.get('test_case', 0))
-                            user_story_credits = int(product.metadata.get('user_story', 0))
-                            
-                            # Process as a new subscription
-                            if not user.stripe_subscription_id:
-                                # Create subscription in Stripe
-                                subscription = stripe.Subscription.create(
-                                    customer=user.stripe_customer_id,
-                                    items=[
-                                        {'price': item.price.id},
-                                    ],
-                                    metadata={
-                                        'created_from_po': 'true',
-                                        'po_number': invoice.metadata.get('po_number')
-                                    }
-                                )
-                                
-                                # Process like a new subscription
-                                transactions.extend(handle_new_subscription(
-                                    user, subscription.id, test_case_credits, user_story_credits
-                                ))
-                        else:
-                            # Process as regular bundle purchase
-                            if bundle_type == 'test_case':
-                                transactions.append(
-                                    Transaction(
-                                        user_id=user.id,
-                                        primary_type='test_case',
-                                        source_type='bundle',
-                                        transaction_type='received',
-                                        value=quantity,
-                                        payment_id=invoice.id,
-                                        description=f"Purchase order test case credits: {invoice.metadata.get('po_number', 'N/A')}"
-                                    )
-                                )
-                                user.current_test_case += quantity
-                            elif bundle_type == 'user_story':
-                                transactions.append(
-                                    Transaction(
-                                        user_id=user.id,
-                                        primary_type='user_story',
-                                        source_type='bundle',
-                                        transaction_type='received',
-                                        value=quantity,
-                                        payment_id=invoice.id,
-                                        description=f"Purchase order user story credits: {invoice.metadata.get('po_number', 'N/A')}"
-                                    )
-                                )
-                                user.current_user_story += quantity
-                
-                # Set validity expiration for non-subscription purchases
-                if transactions and not invoice.metadata.get('is_subscription') == 'true':
-                    # Get validity period from metadata or default to 90 days
-                    validity_days = 90
-                    for item in invoice_items.data:
-                        if item.price and item.price.product:
-                            product = stripe.Product.retrieve(item.price.product)
-                            product_validity = int(product.metadata.get('validity_in_days', 0))
-                            if product_validity > validity_days:
-                                validity_days = product_validity
-                    
-                    # Only update validity if it extends the current validity
-                    new_validity = datetime.utcnow() + timedelta(days=validity_days)
-                    if not user.validity_expiration or new_validity > user.validity_expiration:
-                        user.validity_expiration = new_validity
+                # Use dedicated function to process purchase order invoice
+                transactions = process_purchase_order_invoice(invoice, user, db)
                 
                 # Add all transactions
                 for transaction in transactions:
@@ -1343,7 +1395,7 @@ def webhook():
                 db.commit()
                 print(f"Successfully processed purchase order payment for user {user.email}")
                 
-            # Handle subscription invoice (existing code)
+            # Handle subscription invoice (your existing code unchanged)
             elif subscription_id:
                 subscription = stripe.Subscription.retrieve(subscription_id)
                 product = stripe.Product.retrieve(subscription.plan.product)
@@ -1369,6 +1421,9 @@ def webhook():
                     
                 db.commit()
                 print(f"Successfully processed subscription update for user {user.email}")
+        
+        
+        
         elif event['type'] == 'customer.subscription.deleted':
             subscription = event['data']['object']
             
@@ -1647,6 +1702,8 @@ def process_expired_users():
             'credits_removed': 0,
             'soft_deleted': 0
         }
+
+        # TODO: For trial plan also need to delete user.
         
         # validity_expiration -> 90 days
         # is_blocked
