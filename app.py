@@ -35,7 +35,7 @@ app.config.from_object(Config)
 
 CORS(app, resources={
     r"/*": {
-        "origins": ["http://localhost:5174", "http://127.0.0.1:5174"],
+        "origins": ["http://localhost:5173", "http://127.0.0.1:5173"],
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"]
     }
@@ -426,15 +426,20 @@ def find_matching_subscription_product(bundle_quantities,country_code):
     """Find existing subscription product with matching metadata."""
     products = stripe.Product.list(
         active=True,
-        limit=100
+        limit=1000
     )
+
+    print(f"bundle_quantities: {bundle_quantities}, country_code: {country_code}")
+
+    #TODO: CHANGE INTERVAL HERE 
     
     for product in products.data:
+        
         if (product.metadata.get('type') == 'subscription' and
             product.metadata.get('test_case') == str(bundle_quantities['test_case']) and
             product.metadata.get('user_story') == str(bundle_quantities['user_story']) and
-            product.metadata.get('currency') == get_currency_for_country(country_code) and
-            product.metadata.get('interval') == '3_month'):
+            product.metadata.get('currency') == get_currency_for_country(country_code).lower() and
+            product.metadata.get('interval') == '1_DAY_TESTING'):
             return product
             
     return None
@@ -449,8 +454,22 @@ def generate_subscription_product_name(bundle_quantities):
     
     return f"3-Month Subscription: {' + '.join(parts)}"
 
-def calculate_subscription_price(items):
-    """Calculate subscription price based on original bundle prices and quantities."""
+def calculate_subscription_price(items, currency=None):
+    """
+    Calculate subscription price based on original bundle prices and quantities.
+    Supports different currencies using Stripe's currency_options.
+    
+    Args:
+        items: List of items with priceId and credits
+        currency: Optional currency code (defaults to 'usd' if not provided)
+    
+    Returns:
+        Total price in smallest currency unit (cents/pence)
+    """
+    if currency is None:
+        currency = 'usd'  # Default to USD if no currency specified
+    
+    currency = currency.lower()  # Normalize currency to lowercase
     total_amount = 0
     
     for item in items:
@@ -459,18 +478,26 @@ def calculate_subscription_price(items):
         
         if price_id and quantity:
             # Get original price info
-            price = stripe.Price.retrieve(price_id)
+            price = stripe.Price.retrieve(price_id, expand=['currency_options'])
+            
+            # Determine unit amount based on currency
+            if currency != 'usd' and price.get('currency_options') and currency in price.currency_options:
+                # Use the specific currency option if available
+                currency_option = price.currency_options[currency]
+                unit_amount = currency_option.get('unit_amount')
+            else:
+                # Fall back to default USD price
+                unit_amount = price.unit_amount
             
             # Get base units from transform_quantity
             base_units = price.transform_quantity.get('divide_by') if price.transform_quantity else 1
-            base_unit_amount = price.unit_amount / base_units
+            base_unit_amount = unit_amount / base_units
             
             # Calculate amount for this bundle
             bundle_amount = base_unit_amount * quantity
             total_amount += bundle_amount
     
-    return int(total_amount)  # Ensure we return an integer amount in cents
-
+    return int(total_amount)  # Ensure we return an integer amount in cents/pence
 @app.route('/api/create-checkout-session', methods=['POST'])
 def create_checkout_session():
     db = SessionLocal()
@@ -525,7 +552,7 @@ def create_checkout_session():
         if is_subscription:
             # First, check if a matching subscription product exists
             existing_product = find_matching_subscription_product(bundle_quantities, country_code)
-            
+            print(f"Existing product: {existing_product}")
             if not existing_product:
                 # Create new subscription product with metadata
                 product_name = generate_subscription_product_name(bundle_quantities)
@@ -545,7 +572,7 @@ def create_checkout_session():
                 # Create recurring price for the product
                 price = stripe.Price.create(
                     product=product.id,
-                    unit_amount=calculate_subscription_price(items),
+                    unit_amount=calculate_subscription_price(items,get_currency_for_country(country_code).lower()),
                     currency=get_currency_for_country(country_code).lower(),
                     recurring={
                         #TODO: 
@@ -567,7 +594,7 @@ def create_checkout_session():
             # Create subscription checkout session
             checkout_session = stripe.checkout.Session.create(
                 customer=user.stripe_customer_id,
-                payment_method_types=['card', 'apple_pay', 'google_pay'],
+                payment_method_types=['card'],
                 line_items=[{
                     'price': price.id,
                     'quantity': 1
@@ -640,7 +667,7 @@ def create_purchase_order():
         country_code = data.get('countryCode', 'GB')
         company_name = data.get('companyName', '')
         po_number = data.get('poNumber', '')
-
+        print(f"user email in create purchase order : {email}")
         if not email:
             return jsonify({'error': 'Email is required'}), 400
             
@@ -748,6 +775,7 @@ def create_purchase_order():
             # Create a draft invoice with charge_automatically collection method
             invoice = stripe.Invoice.create(
                 customer=user.stripe_customer_id,
+                currency=get_currency_for_country(country_code).lower(),
                 collection_method='charge_automatically',  # Charge automatically
                 auto_advance=False,  # Keep it as a draft until finalized
                 description=f"Purchase Order: {po_number}" if po_number else "Purchase Order",
@@ -768,6 +796,7 @@ def create_purchase_order():
             # Add the item to the invoice
             stripe.InvoiceItem.create(
                 customer=user.stripe_customer_id,
+                currency=get_currency_for_country(country_code).lower(),
                 invoice=invoice.id,
                 price=one_time_price.id,
                 quantity=1,
@@ -780,6 +809,7 @@ def create_purchase_order():
             # Create a draft invoice for one-time purchase with send_invoice
             invoice = stripe.Invoice.create(
                 customer=user.stripe_customer_id,
+                currency=get_currency_for_country(country_code).lower(),
                 collection_method='send_invoice',
                 days_until_due=30,
                 auto_advance=False,  # Keep it as a draft until finalized
@@ -809,6 +839,7 @@ def create_purchase_order():
                     # Add invoice item
                     stripe.InvoiceItem.create(
                         customer=user.stripe_customer_id,
+                        currency=get_currency_for_country(country_code).lower(),
                         invoice=invoice.id,
                         price=price_id,
                         quantity=quantity,
@@ -925,7 +956,7 @@ def create_portal_session():
         # Create billing portal session
         session = stripe.billing_portal.Session.create(
             customer=user.stripe_customer_id,
-            return_url=f"{request.headers.get('Origin', 'http://localhost:5174')}/subscriptions"
+            return_url=f"{request.headers.get('Origin', 'http://localhost:5173')}/subscriptions"
         )
 
         return jsonify({
@@ -1193,6 +1224,7 @@ def process_purchase_order_invoice(invoice, user, db):
                 print(f"Set bundle validity expiration to {user.validity_expiration} for user {user.email}")
     
     return transactions
+
 def handle_subscription_renewal(user, subscription_id, test_case_credits, user_story_credits):
     """Handle subscription renewal and return transactions."""
     transactions = [
@@ -1228,30 +1260,30 @@ def handle_new_subscription(user, subscription_id, test_case_credits, user_story
     transactions = []
     
     # Reset trial credits only if they're from a trial (both conditions must be true)
-    if user.has_used_trial and user.trial_end_date:
-        if user.current_test_case > 0:
-            transactions.append(Transaction(
-                user_id=user.id,
-                primary_type='test_case',
-                source_type='trial',
-                transaction_type='reset',
-                value=-user.current_test_case,
-                subscription_id=subscription_id,
-                description='Reset test case credits from trial to subscription'
-            ))
-            user.current_test_case = 0
+    # if user.has_used_trial and user.trial_end_date:
+    #     if user.current_test_case > 0:
+    #         transactions.append(Transaction(
+    #             user_id=user.id,
+    #             primary_type='test_case',
+    #             source_type='trial',
+    #             transaction_type='reset',
+    #             value=-user.current_test_case,
+    #             subscription_id=subscription_id,
+    #             description='Reset test case credits from trial to subscription'
+    #         ))
+    #         user.current_test_case = 0
 
-        if user.current_user_story > 0:
-            transactions.append(Transaction(
-                user_id=user.id,
-                primary_type='user_story',
-                source_type='trial',
-                transaction_type='reset',
-                value=-user.current_user_story,
-                subscription_id=subscription_id,
-                description='Reset user story credits from trial to subscription'
-            ))
-            user.current_user_story = 0
+    #     if user.current_user_story > 0:
+    #         transactions.append(Transaction(
+    #             user_id=user.id,
+    #             primary_type='user_story',
+    #             source_type='trial',
+    #             transaction_type='reset',
+    #             value=-user.current_user_story,
+    #             subscription_id=subscription_id,
+    #             description='Reset user story credits from trial to subscription'
+    #         ))
+    #         user.current_user_story = 0
     
     # Add subscription transactions only for non-zero credits
     if test_case_credits > 0:
@@ -1345,7 +1377,7 @@ def webhook():
                     #TODO:
                     # user.validity_expiration = datetime.utcnow() + timedelta(days=max_validity_days)
                     user.validity_expiration = datetime.utcnow() # FOR TESTING PURPOSE
-                    transactions.extend(reset_trial_credits(user, session.id, db))
+                    # transactions.extend(reset_trial_credits(user, session.id, db))
 
                 # Process each line item
                 for line_item in session_with_items.line_items.data:
@@ -1988,13 +2020,7 @@ scheduler.add_job(
     replace_existing=True
 )
 
-scheduler.add_job(
-    check_benefits_expiration,
-    CronTrigger(hour=0, minute=0),  # Run at midnight every day
-    id='benefits_expiration_check',
-    name='Check for expired benefits',
-    replace_existing=True
-)
+
 
 if __name__ == '__main__':
     try:
@@ -2002,7 +2028,7 @@ if __name__ == '__main__':
         scheduler.start()
         
         # Start the Flask app
-        app.run(host='0.0.0.0', port=5000)
+        app.run(host='0.0.0.0', port=5000,debug=True)
     except (KeyboardInterrupt, SystemExit):
         
         scheduler.shutdown()
