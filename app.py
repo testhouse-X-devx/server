@@ -35,7 +35,7 @@ app.config.from_object(Config)
 
 CORS(app, resources={
     r"/*": {
-        "origins": ["http://localhost:5173", "http://127.0.0.1:5173"],
+        "origins": ["http://localhost:5174", "http://127.0.0.1:5174"],
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"]
     }
@@ -663,11 +663,11 @@ def create_purchase_order():
         email = data.get('email')
         items = data.get('items', [])  # Array of {priceId, credits}
         is_subscription = data.get('isSubscription', False)
-        print(f"country code in purchase order: {data.get('countryCode')}")
         country_code = data.get('countryCode', 'GB')
         company_name = data.get('companyName', '')
         po_number = data.get('poNumber', '')
-        print(f"user email in create purchase order : {email}")
+        print(f"user email in create purchase order: {email}")
+        
         if not email:
             return jsonify({'error': 'Email is required'}), 400
             
@@ -715,14 +715,11 @@ def create_purchase_order():
                     user.stripe_customer_id,
                     name=company_name
                 )
-
-        # Set up invoice items
-        product_descriptions = []
-        
+        print(f"is subbscription : {is_subscription}")
         if is_subscription:
             # First, check if a matching subscription product exists
             existing_product = find_matching_subscription_product(bundle_quantities, country_code)
-            
+            print(f"existing_product : {existing_product}")
             if not existing_product:
                 # Create new subscription product with metadata
                 product_name = generate_subscription_product_name(bundle_quantities)
@@ -740,17 +737,9 @@ def create_purchase_order():
                 product = existing_product
             
             # Calculate the total price
-            subscription_amount = calculate_subscription_price(items)
+            subscription_amount = calculate_subscription_price(items, get_currency_for_country(country_code).lower())
             
-            # Create a one-time price for the invoice
-            one_time_price = stripe.Price.create(
-                product=product.id,
-                unit_amount=subscription_amount,
-                currency=get_currency_for_country(country_code).lower()
-                # No recurring parameter makes this a one-time price
-            )
-            
-            # Also create a recurring price (to be used later in the webhook)
+            # Create a recurring price for the subscription
             recurring_price = stripe.Price.create(
                 product=product.id,
                 unit_amount=subscription_amount,
@@ -761,49 +750,59 @@ def create_purchase_order():
                 }
             )
             
-            # Create a description for the invoice
-            for item in items:
-                price_id = item.get('priceId')
-                quantity = item.get('credits', 0)
-                
-                if price_id and quantity:
-                    # Get product info
-                    price = stripe.Price.retrieve(price_id, expand=['product'])
-                    product_name = price.product.name
-                    product_descriptions.append(f"{quantity} credits of {product_name}")
-            
-            # Create a draft invoice with charge_automatically collection method
-            invoice = stripe.Invoice.create(
+            # Create the subscription directly with send_invoice collection method
+            subscription = stripe.Subscription.create(
                 customer=user.stripe_customer_id,
-                currency=get_currency_for_country(country_code).lower(),
-                collection_method='charge_automatically',  # Charge automatically
-                auto_advance=False,  # Keep it as a draft until finalized
-                description=f"Purchase Order: {po_number}" if po_number else "Purchase Order",
-                custom_fields=[
-                    {"name": "PO Number", "value": po_number} if po_number else None
+                items=[
+                    {'price': recurring_price.id}
                 ],
+                collection_method='send_invoice',
+                days_until_due=5,  # Invoice due in 5 days
                 metadata={
                     "po_number": po_number,
-                    "is_subscription": "true",
+                    "is_purchase_order": "true",
                     "subscription_type": "3_month",
                     "product_id": product.id,
                     "test_case": str(bundle_quantities['test_case']),
-                    "user_story": str(bundle_quantities['user_story']),
-                    "recurring_price_id": recurring_price.id  # Store recurring price ID for webhook
+                    "user_story": str(bundle_quantities['user_story'])
                 }
             )
-            
-            # Add the item to the invoice
-            stripe.InvoiceItem.create(
-                customer=user.stripe_customer_id,
-                currency=get_currency_for_country(country_code).lower(),
-                invoice=invoice.id,
-                price=one_time_price.id,
-                quantity=1,
-                description=f"3-Month Subscription: {', '.join(product_descriptions)}"
-            )
+            print(f"subscription created",subscription)
+            # Get the invoice for this subscription
+            invoice = stripe.Invoice.retrieve(subscription.latest_invoice)
 
-            # TODO : STEFFY ADD THE MAIL TRIGGER HERE WHERE YOU SHARE THE INVOICE LINK.
+            if po_number:
+                invoice = stripe.Invoice.modify(
+                    invoice.id,
+                    metadata={
+                        "po_number": po_number,
+                        "is_purchase_order":"true"
+                }
+                    
+                )
+            print(f"invoice after modified: {invoice}")
+            print(f"retriving subscription invoice : {invoice}")
+            
+            finalized_invoice = stripe.Invoice.finalize_invoice(invoice.id)
+    
+            # Send the invoice
+            sent_invoice = stripe.Invoice.send_invoice(finalized_invoice.id)
+            print(f"check if the invoice is not draft anymore")
+            # Retrieve the invoice again to get the hosted_invoice_url
+            final_invoice = stripe.Invoice.retrieve(sent_invoice.id)
+            print(f"final invoice : {final_invoice}")
+            # Return subscription and invoice details
+            return jsonify({
+                'success': True,
+                'subscription': {
+                    'id': subscription.id,
+                    'status': subscription.status
+                },
+                'invoice': {
+                    'id': invoice.id,
+                    'hosted_invoice_url': final_invoice.hosted_invoice_url
+                }
+            }), 200
             
         else:
             # Create a draft invoice for one-time purchase with send_invoice
@@ -819,7 +818,8 @@ def create_purchase_order():
                 ],
                 metadata={
                     "po_number": po_number,
-                    "is_subscription": "false"
+                    "is_subscription": "false",
+                    "is_purchase_order": "true"
                 }
             )
             
@@ -833,9 +833,6 @@ def create_purchase_order():
                     price = stripe.Price.retrieve(price_id, expand=['product'])
                     product = price.product
                     
-                    # Add to product descriptions
-                    product_descriptions.append(f"{quantity} credits of {product.name}")
-                    
                     # Add invoice item
                     stripe.InvoiceItem.create(
                         customer=user.stripe_customer_id,
@@ -846,31 +843,26 @@ def create_purchase_order():
                         description=f"{quantity} credits of {product.name}"
                     )
 
-        # Finalize the invoice
-        finalized_invoice = stripe.Invoice.finalize_invoice(invoice.id)
-        
-        # For send_invoice method, send the invoice via email
-        if not is_subscription:
+            # Finalize the invoice
+            finalized_invoice = stripe.Invoice.finalize_invoice(invoice.id)
+            
+            # Send the invoice via email
             sent_invoice = stripe.Invoice.send_invoice(finalized_invoice.id)
-            invoice_to_return = sent_invoice
-        else:
-            # For charge_automatically, the invoice is attempted to be paid immediately after finalization
-            invoice_to_return = finalized_invoice
-        
-        # Return invoice details
-        return jsonify({
-            'success': True,
-            'invoice': {
-                'id': invoice_to_return.id,
-                'number': invoice_to_return.number,
-                'hosted_invoice_url': invoice_to_return.hosted_invoice_url if hasattr(invoice_to_return, 'hosted_invoice_url') else None,
-                'invoice_pdf': invoice_to_return.invoice_pdf if hasattr(invoice_to_return, 'invoice_pdf') else None,
-                'status': invoice_to_return.status,
-                'due_date': datetime.fromtimestamp(invoice_to_return.due_date).strftime('%Y-%m-%d') if hasattr(invoice_to_return, 'due_date') and invoice_to_return.due_date else None,
-                'amount_due': invoice_to_return.amount_due / 100,  # Convert from cents to dollars/pounds
-                'currency': invoice_to_return.currency.upper()
-            }
-        }), 200
+            
+            # Return invoice details
+            return jsonify({
+                'success': True,
+                'invoice': {
+                    'id': sent_invoice.id,
+                    'number': sent_invoice.number,
+                    'hosted_invoice_url': sent_invoice.hosted_invoice_url,
+                    'invoice_pdf': sent_invoice.invoice_pdf,
+                    'status': sent_invoice.status,
+                    'due_date': datetime.fromtimestamp(sent_invoice.due_date).strftime('%Y-%m-%d') if sent_invoice.due_date else None,
+                    'amount_due': sent_invoice.amount_due / 100,
+                    'currency': sent_invoice.currency.upper()
+                }
+            }), 200
 
     except stripe.error.StripeError as e:
         db.rollback()
@@ -956,7 +948,7 @@ def create_portal_session():
         # Create billing portal session
         session = stripe.billing_portal.Session.create(
             customer=user.stripe_customer_id,
-            return_url=f"{request.headers.get('Origin', 'http://localhost:5173')}/subscriptions"
+            return_url=f"{request.headers.get('Origin', 'http://localhost:5174')}/subscriptions"
         )
 
         return jsonify({
@@ -1114,7 +1106,7 @@ def process_purchase_order_invoice(invoice, user, db):
     
     # Get invoice items
     invoice_items = stripe.InvoiceItem.list(invoice=invoice.id)
-    
+    print(f"invoice meta data : {invoice.metadata}")
     # Process each invoice item
     transactions = []
     
@@ -1408,6 +1400,16 @@ def webhook():
             if not user:
                 print(f"User not found for customer {customer_id}")
                 return jsonify({'error': 'User not found'}), 404
+            
+            # Check if we've already processed this invoice
+            existing_transaction = db.query(Transaction).filter(
+                Transaction.user_id == user.id,
+                Transaction.payment_id == invoice.id
+            ).first()
+            
+            if existing_transaction:
+                print(f"Invoice {invoice.id} already processed, skipping")
+                return jsonify({'status': 'already processed'}), 200
                     
             # Handle unblocking if user was blocked but not deleted
             if user.is_blocked and not user.is_deleted:
@@ -1415,21 +1417,119 @@ def webhook():
                 user.credit_cleanup_date = None
                 user.account_deletion_date = None
             
-            # Check if this is a purchase order invoice
-            if not subscription_id and invoice.get('metadata', {}).get('po_number'):
-                # Use dedicated function to process purchase order invoice
-                transactions = process_purchase_order_invoice(invoice, user, db)
+            print(f"invoice.metadata :{invoice.metadata}")
+            # Check if this is a purchase order invoice without subscription
+            if not subscription_id and invoice.metadata.get('is_purchase_order') == 'true':
+                print(f"Processing non-subscription purchase order invoice for user {user.email}")
+                
+                # Get invoice items
+                invoice_items = stripe.InvoiceItem.list(invoice=invoice.id)
+                
+                # Process each invoice item
+                transactions = []
+                for item in invoice_items.data:
+                    # Skip if no price or product
+                    if not item.price:
+                        continue
+                        
+                    price = stripe.Price.retrieve(item.price.id, expand=['product'])
+                    product = price.product
+                    
+                    # Determine bundle type from product metadata
+                    bundle_type = product.metadata.get('bundle_type', '').lower()
+                    quantity = item.quantity
+                    
+                    if bundle_type == 'test_case':
+                        transactions.append(
+                            Transaction(
+                                user_id=user.id,
+                                primary_type='test_case',
+                                source_type='bundle',
+                                transaction_type='received',
+                                value=quantity,
+                                payment_id=invoice.id,
+                                description=f"Purchase order test case credits: {invoice.metadata.get('po_number', 'N/A')}"
+                            )
+                        )
+                        user.current_test_case += quantity
+                    elif bundle_type == 'user_story':
+                        transactions.append(
+                            Transaction(
+                                user_id=user.id,
+                                primary_type='user_story',
+                                source_type='bundle',
+                                transaction_type='received',
+                                value=quantity,
+                                payment_id=invoice.id,
+                                description=f"Purchase order user story credits: {invoice.metadata.get('po_number', 'N/A')}"
+                            )
+                        )
+                        user.current_user_story += quantity
+                
+                # Set validity expiration for non-subscription purchases
+                if transactions:
+                    # Get validity period from metadata or default to 90 days
+                    validity_days = 90
+                    for item in invoice_items.data:
+                        if item.price and hasattr(item.price, 'product'):
+                            product = stripe.Product.retrieve(item.price.product)
+                            product_validity = int(product.metadata.get('validity_in_days', 0))
+                            if product_validity > validity_days:
+                                validity_days = product_validity
+                    
+                    # Only update validity if it extends the current validity
+                    new_validity = datetime.utcnow() + timedelta(days=validity_days)
+                    if not user.validity_expiration or new_validity > user.validity_expiration:
+                        user.validity_expiration = new_validity
+                        print(f"Set bundle validity expiration to {user.validity_expiration} for user {user.email}")
                 
                 # Add all transactions
                 for transaction in transactions:
                     db.add(transaction)
-                    
-                db.commit()
-                print(f"Successfully processed purchase order payment for user {user.email}")
                 
-            # Handle subscription invoice (your existing code unchanged)
+                db.commit()
+                print(f"Successfully processed non-subscription purchase order for user {user.email}")
+                
+            # Handle subscription invoice for purchase order
+            elif subscription_id and invoice.metadata.get('is_purchase_order') == 'true':
+                print(f"Processing subscription purchase order invoice for user {user.email}")
+                
+                subscription = stripe.Subscription.retrieve(subscription_id)
+                
+                # Store the subscription ID with the user
+                user.stripe_subscription_id = subscription_id
+                
+            
+                print("fetching product ")
+                product = stripe.Product.retrieve(subscription.plan.product)
+                print(f"fetching product : {product}")
+                if product:
+                    
+                    test_case_credits = int(product.metadata.get('test_case', 0))
+                    user_story_credits = int(product.metadata.get('user_story', 0))
+                    
+                    # Process like a new subscription
+                    transactions = handle_new_subscription(
+                        user, subscription_id, test_case_credits, user_story_credits
+                    )
+                    
+                    # Add all transactions
+                    for transaction in transactions:
+                        db.add(transaction)
+                    
+                    db.commit()
+                    print(f"Successfully processed subscription purchase order for user {user.email}")
+                
+            # Handle normal subscription invoice 
             elif subscription_id:
                 subscription = stripe.Subscription.retrieve(subscription_id)
+                
+                # Skip if this is a purchase order subscription that we've already handled above
+                if subscription.metadata.get('is_purchase_order') == 'true':
+                    print(f"Skipping purchase order subscription for user {user.email}")
+                    return jsonify({'status': 'skipped purchase order subscription'}), 200
+                
+                # Process as a normal subscription
                 product = stripe.Product.retrieve(subscription.plan.product)
 
                 test_case_credits = int(product.metadata.get('test_case', 0))
@@ -1446,14 +1546,12 @@ def webhook():
                     transactions.extend(handle_new_subscription(
                         user, subscription_id, test_case_credits, user_story_credits
                     ))
-                    #TODO: ADD MAIL FUNCTION HERE FOR : If auto-debit is enabled then a mail should be sent informing the same. 
 
                 for transaction in transactions:
                     db.add(transaction)
                     
                 db.commit()
                 print(f"Successfully processed subscription update for user {user.email}")
-        
         
         
         elif event['type'] == 'customer.subscription.deleted':
